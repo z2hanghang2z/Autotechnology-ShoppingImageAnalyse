@@ -1,0 +1,29 @@
+# ============================================================
+#  .gitattributes
+#  统一换行符，避免跨平台克隆后文件损坏
+# ============================================================
+
+# 默认：按文本处理，检出时用平台默认换行符
+* text=auto
+
+# ★ Windows 批处理必须用 CRLF，否则 cmd.exe 会逐行错乱解析
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 脚本与配置统一用 LF，避免跨平台差异
+*.py   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+
+# 二进制文件不做换行符转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.ico  binary
+*.xlsx binary
+*.xls  binary
+*.zip  binary

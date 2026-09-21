@@ -1,0 +1,114 @@
+# 标题规则配置
+# 所有可调参数集中在此，改规则不用改代码
+
+# ---------- 长度规则 ----------
+length:
+  # 是否强制精确长度
+  exact: true
+  # 目标长度
+  target: 100
+  # 计数方式（用户要求：1 个汉字 = 2 字符，1 个英文/数字/符号 = 1 字符）
+  #   taobao —— 汉字算 2，其他算 1   ← 当前使用
+  #   char   —— 每个字符都算 1
+  # 注意：target 是「字符数」，在 taobao 口径下 100 字符约等于 50 个汉字
+  count_mode: taobao
+  # 允许的长度浮动（exact=true 时忽略）
+  tolerance: 0
+
+# ---------- 机型关键词规则 ----------
+model_keyword:
+  # 整个标题中，机型关键词只允许出现一次
+  once_only: true
+  # 机型规范化映射（小写输入 → 标准写法）
+  normalize:
+    iphone: iPhone
+    ipad: iPad
+  # 识别机型的正则（用于从模型输出中剥离，避免重复出现）
+  detect_patterns:
+    - "iPhone\\s?\\d+\\s?(Pro\\s?Max|Pro|Plus|Mini|Max|SE|e|Air|Duo|U)?"
+    - "苹果"
+    - "iPhone"
+    - "ipad"
+    - "iPad"
+    - "三星"
+    - "华为"
+    - "小米"
+    - "OPPO"
+    - "vivo"
+    - "荣耀"
+    - "折叠屏"
+
+# ---------- 结构组装顺序 ----------
+# 说明：
+#   固定段（机型段/核心词段/材质词）承载全部必填词，是"必现"的；
+#   但它们的**先后位置可以轮换**，模型特征词也能插到不同位置，
+#   这样标题前半段就不会千篇一律。
+#
+# 可用槽位：
+#   model_prefix  —— 适用苹果{机型}（提供「苹果」「iPhone」「机型」）
+#   core_suffix   —— 新款手机壳防摔（提供「新款」「手机壳」「防摔」）
+#   material      —— 材质词
+#   keywords      —— 模型特征关键词（全部）
+#   keywords_a    —— 模型特征关键词（前半）
+#   keywords_b    —— 模型特征关键词（后半）
+#   padding       —— 补足词（永远放最后，用于凑满长度）
+structure:
+  # 组装模板：按行轮换（第 1 行用第 1 个，第 2 行用第 2 个……循环）
+  # 每个模板都必须包含全部固定段，否则必填词会缺失
+  patterns:
+    # 1 特征前置：开头就是图案风格词
+    - [keywords_a, model_prefix, core_suffix, keywords_b, material, padding]
+    # 2 经典式：机型 + 核心词 + 材质 + 特征
+    - [model_prefix, core_suffix, material, keywords, padding]
+    # 3 特征夹心：机型 + 特征 + 核心词 + 特征 + 材质
+    - [model_prefix, keywords_a, core_suffix, keywords_b, material, padding]
+    # 4 核心词前置
+    - [core_suffix, model_prefix, keywords_a, material, keywords_b, padding]
+    # 5 材质提前
+    - [model_prefix, material, keywords_a, core_suffix, keywords_b, padding]
+    # 6 特征前置 + 核心词居中
+    - [keywords_a, core_suffix, model_prefix, keywords_b, material, padding]
+  # 兜底模板（配置有误或未启用轮换时使用）
+  default_pattern: [model_prefix, core_suffix, material, keywords, padding]
+
+  # 是否启用模板轮换
+  rotate_patterns: true
+  # 固定段内部顺序是否也参与轮换（进一步降低雷同感）
+  rotate_segments: false
+
+# ---------- 差异化策略（要求：商品名称尽量不要重复）----------
+differentiation:
+  enabled: true
+  # 补足词跨商品不重复：同一批里，补足词用过就不再给下一个商品用
+  avoid_repeat_padding: true
+  # 关键词顺序按行轮换：不同行的关键词排列顺序不同，降低雷同感
+  rotate_keywords: true
+  # 生成后计算两两相似度并输出报告
+  report_similarity: true
+  # 相似度告警阈值（超过则标记提醒人工关注）
+  similarity_warn: 0.85
+  # 相似度严重阈值（超过则判定不合格）
+  similarity_fail: 0.95
+
+# ---------- 重复词控制 ----------
+dedup:
+  # 同一关键词在标题中不重复出现
+  enabled: true
+  # 除机型外，其他词最多出现的次数
+  max_repeat: 1
+
+# ---------- 校验开关 ----------
+validate:
+  check_length: true          # 长度是否精确（按 count_mode 口径）
+  check_required: true        # 必填词是否齐全
+  check_forbidden: true       # 是否含违禁词
+  check_punctuation: true     # ★ 是否含标点符号（用户要求名称不能有标点，/ 也不行）
+  check_model_once: true      # 机型是否只出现一次
+  check_duplicate: true       # 是否有重复关键词
+
+# ---------- 重试 ----------
+retry:
+  # 校验不通过时最多重写几次
+  max_attempts: 3
+  # 每次重试把上次的问题反馈给模型
+  feed_back_errors: true

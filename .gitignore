@@ -1,0 +1,56 @@
+# ============================================================
+#  .gitignore
+#  原则：只提交「程序 + 配置 + 文档」，业务数据与临时产物一律不入库
+# ============================================================
+
+# ---------- 业务数据（绝不入库）----------
+# 含商品主图、商品资料路径、生成的名称等，属于业务资产
+referexcel/
+output/
+photo/
+
+# ---------- Excel 文件与备份 ----------
+*.xlsx
+*.xls
+*.xlsm
+*.xlsb
+*_backup_*.xlsx
+
+# ---------- AI 工具工作目录（含内部笔记与记忆）----------
+.workbuddy-ai/
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- 测试与缓存 ----------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---------- 日志与临时文件 ----------
+*.log
+*.tmp
+*.temp
+~$*
+
+# ---------- 系统与编辑器 ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
