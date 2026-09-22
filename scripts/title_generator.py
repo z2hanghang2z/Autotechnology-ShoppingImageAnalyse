@@ -24,10 +24,14 @@ from title_builder import (
     all_forbidden_words,
     assemble_exact,
     build_segments,
+    collect_bank_words,
     count_length,
+    detect_features,
     extract_attrs,
+    format_model_group,
     normalize_model,
     pick_material,
+    split_models,
     strip_model_keywords,
     validate_title,
 )
@@ -47,6 +51,7 @@ PROMPT_TEMPLATE = """请仔细观察这张手机壳图片，输出 JSON 格式�
     "图案": "图中真实可见的图案元素",
     "风格": "整体风格（如可爱/简约/复古/潮酷等）"
   }},
+  "material": "从下面材质列表中选出最符合图片的一个，只能选一个：{materials}",
   "keywords": ["关键词1", "关键词2", "..."]
 }}
 
@@ -55,16 +60,17 @@ PROMPT_TEMPLATE = """请仔细观察这张手机壳图片，输出 JSON 格式�
 2. 每个关键词 2 到 6 个字符
 3. 覆盖这些维度：工艺、功能、风格、适用人群、使用场景
 4. 必须包含图中真实可见的特征（颜色、图案元素）
-5. 【严禁】包含材质词，材质由商品资料提供，不要写
-6. 【严禁】包含任何机型信息（iPhone、苹果、三星、华为、小米、折叠屏等），机型由商品资料提供
-7. 可以包含通用风格词（如 ins风、Q版、3D立体），但【严禁】自创任何英文品牌名、
+5. 【严禁】包含任何机型信息（iPhone、苹果、三星、华为、小米、折叠屏等），机型由商品资料提供
+6. 可以包含通用风格词（如 ins风、Q版、3D立体），但【严禁】自创任何英文品牌名、
    英文单词串或看起来像品牌名的字母组合（例如 timeLUCKYEH 这类无意义字母串）
-8. 【严禁】堆砌同前缀词。例如不要同时给出"撞色款""撞色设计""撞色风格"，
+7. 【严禁】堆砌同前缀词。例如不要同时给出"撞色款""撞色设计""撞色风格"，
    也不要给出只换尾字的词，只保留最有代表性的一个
-9. 【严禁】包含违禁词：最、第一、顶级、唯一、100%、万能、永久、官方、正品、授权、正版
-10. 【严禁】包含图片上的水印文字（如 wf、wj）
-11. 【严禁】包含其他类目词（钢化膜、充电器、数据线、耳机、支架）
-12. 关键词之间语义不要重复，每个词都应是独立的信息点
+8. 【严禁】包含违禁词：最、第一、顶级、唯一、100%、万能、永久、官方、正品、授权、正版
+9. 【严禁】包含图片上的水印文字（如 wf、wj）
+10. 【严禁】包含其他类目词（钢化膜、充电器、数据线、耳机）
+11. 关键词之间语义不要重复，每个词都应是独立的信息点
+
+说明：material 字段仅在商品资料未提供材质时才会被采用，请如实判断，不要编造。
 
 只输出 JSON，不要任何解释文字，不要 markdown 代码块。"""
 
@@ -109,16 +115,22 @@ def _has_bad_ascii(kw, ascii_cfg):
 
 
 def filter_keywords(keywords, forbidden_words, rules, prefix_text="",
-                    reserved_words=None, ascii_cfg=None):
+                    reserved_words=None, ascii_cfg=None, soft_reserved=None):
     """
     过滤模型给出的关键词：
         去违禁词 / 去机型词 / 去材质词 / 去自创英文串 / 去近义堆砌 /
         去含标点符号的（用户要求商品名称不能有标点）/ 去空白
+
+    reserved_words —— 硬性禁用：关键词里**含**这些词就丢弃
+                      （必填词、材质词、机型，避免重复表达）
+    soft_reserved  —— 软性禁用：只挡**完全相同**的词
+                      （条件特征词，如「支架」；这样「旋转支架」这类更具体的词才能用上）
     """
     from title_builder import is_near_duplicate, find_punctuation
 
     out, seen = [], []
     reserved = [w for w in (reserved_words or []) if w]
+    soft = set(w for w in (soft_reserved or []) if w)
 
     for kw in keywords or []:
         kw = str(kw).strip()
@@ -126,6 +138,8 @@ def filter_keywords(keywords, forbidden_words, rules, prefix_text="",
         if not kw or kw in seen:
             continue
         if find_punctuation(kw):          # 含标点 → 丢弃
+            continue
+        if kw in soft:                    # 与特征词完全相同 → 丢弃
             continue
         if any(fw and fw in kw for fw in forbidden_words):
             continue
@@ -148,17 +162,19 @@ def filter_keywords(keywords, forbidden_words, rules, prefix_text="",
 
 # ---------------------------------------------------------------- 生成
 
-def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=0):
+def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=0,
+                 models_text=None):
     """
     为单个商品生成名称。
 
-    image_path —— 商品主图路径（第二列）
-    row_data   —— 商品资料原文（第一列），内含材质 / 系列 / 适配机型
-    exclude_padding —— 本批次已被其他商品用过的补足词（差异化）
+    image_path —— 商品主图路径
+    row_data   —— 商品资料原文（第一列），内含材质 / 系列
+    models_text—— 机型文本（来自机型列，如 iphone18/17/16/15/14）；
+                  不传则退回从 row_data 里解析
+    exclude_padding —— 本批次已被其他商品用过的词（差异化）
     rotate     —— 轮换偏移（行号），用于组装模板与关键词顺序
 
-    返回 dict：
-        {title, issues, elapsed, tokens, attempts, used, attrs}
+    返回 dict：{title, issues, elapsed, tokens, attempts, used, attrs, segments}
     """
     rules = confs["rules"]
     required_cfg = confs["required"]
@@ -176,19 +192,26 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
     stcfg = rules.get("structure", {}) or {}
     patterns = stcfg.get("patterns") or []
 
-    # ---------- 1. 从商品资料里取硬参数（材质 / 系列 / 机型）----------
+    # ---------- 1. 从商品资料里取硬参数（材质 / 系列）----------
     attrs = extract_attrs(row_data, materials)
-    model_name = normalize_model(attrs.get("model") or "")
+
+    # ---------- 2. 机型：优先用机型列，取不到才从商品资料里解析 ----------
+    src = (models_text or "").strip()
+    if not src:
+        src = attrs.get("model") or ""
+    models = split_models(src)
+    model_name = format_model_group(models)
 
     # 材质：优先用商品资料里的，取不到才让模型看图判断
     material = attrs.get("material") or ""
 
     total_elapsed, total_tokens = 0.0, 0
     last_title, last_issues, last_used = "", [], []
+    last_segments, last_features = {}, []
     feedback = ""
 
     for attempt in range(1, max_attempts + 1):
-        prompt = PROMPT_TEMPLATE
+        prompt = PROMPT_TEMPLATE.format(materials="/".join(materials))
         if feedback:
             prompt += f"\n\n【上次的问题，请修正】\n{feedback}"
 
@@ -212,15 +235,51 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
             material = pick_material(data.get("material", ""),
                                      " ".join(raw_keywords), required_cfg)
 
-        segments = build_segments(model_name, material, required_cfg)
+        # ★ 条件特征词：商品是磁吸的就必须带「磁吸magsafe」，是支架的就必须带「支架」
+        feature_words = detect_features(row_data, raw_keywords, required_cfg)
+
+        segments = build_segments(model_name, material, required_cfg,
+                                  feature_words, models=models)
         prefix_text = "".join(segments.values())
-        # 必填词 + 材质词 + 机型（含多机型的每一段）都不得在关键词里重复出现
-        reserved = list(required_cfg.get("must_include", []) or []) + materials
-        reserved += [p for p in model_name.split("/") if p]
-        reserved.append(model_name)
-        kws = filter_keywords(raw_keywords, fwords, rules,
+
+        # 固定段已占用的词，关键词里不得再出现（避免重复表达）
+        reserved = list(required_cfg.get("must_include", []) or [])
+        if material:
+            reserved.append(material)
+        reserved += models
+        reserved += [re.sub(r"^iPhone", "", m) for m in models]
+
+        # ★ 关键词池 = 模型看图特征词 + 四类运营词库（主推词→搜索词→卖点词→精准词）
+        #   差异化：本批次已被其他商品用过的词库词，排到后面（优先用没用过的）
+        bank_words = collect_bank_words(required_cfg)
+        if exclude_padding:
+            fresh = [w for w in bank_words if w not in exclude_padding]
+            reused = [w for w in bank_words if w in exclude_padding]
+            bank_words = fresh + reused
+        keyword_pool = list(raw_keywords) + bank_words
+        kws = filter_keywords(keyword_pool, fwords, rules,
                               prefix_text=prefix_text, reserved_words=reserved,
-                              ascii_cfg=ascii_cfg)
+                              ascii_cfg=ascii_cfg, soft_reserved=feature_words)
+
+        # ★ 限制模型特征词的占比：模型词最多占目标长度的 model_keyword_quota%
+        #   剩下的长度留给运营词库，避免模型词吃光预算
+        quota_pct = float(stcfg.get("model_keyword_quota", 0) or 0)
+        if quota_pct > 0:
+            quota_w = int(target * quota_pct / 100)
+            model_set = set()
+            for k in raw_keywords:
+                k = re.sub(r"[\s,，、;；/|]+", "", str(k).strip())
+                if k:
+                    model_set.add(k)
+            capped, used_w = [], 0
+            for kw in kws:
+                if kw in model_set:
+                    w = count_length(kw, count_mode)
+                    if used_w + w > quota_w:
+                        continue          # 超出配额 → 丢弃该模型词
+                    used_w += w
+                capped.append(kw)
+            kws = capped
 
         # 组装模板按行轮换
         if patterns and stcfg.get("rotate_patterns", True):
@@ -243,11 +302,13 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
                 title = title + parity_filler
                 exact = count_length(title, count_mode) == target
 
-        issues = validate_title(title, model_name, rules, required_cfg, forbidden_cfg)
+        issues = validate_title(title, model_name, rules, required_cfg, forbidden_cfg,
+                                models=models)
         if not exact:
             issues.append("无法精确凑满目标长度")
 
         last_title, last_issues, last_used = title, issues, used
+        last_segments, last_features = segments, feature_words
         if not issues:
             break
         feedback = "；".join(issues)
@@ -259,5 +320,7 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
         "tokens": total_tokens,
         "attempts": attempt,
         "used": last_used,
-        "attrs": {**attrs, "model": model_name, "material": material},
+        "attrs": {**attrs, "model": model_name, "models": models, "material": material},
+        "segments": last_segments,
+        "feature_words": last_features,
     }

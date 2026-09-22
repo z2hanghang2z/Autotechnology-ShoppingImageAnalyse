@@ -37,6 +37,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from extract_cell_images import extract
 from ollama_client import health_check, load_config
 from title_builder import (
+    check_pattern_models_separated,
+    check_word_conflicts,
+    collect_bank_words,
     count_length,
     load_all_configs,
     pairwise_similarity,
@@ -138,6 +141,8 @@ def main():
     ap.add_argument("--sheet", default=None, help="工作表名（默认第一个）")
     ap.add_argument("--data-col", default=DEFAULT_DATA_COL,
                     help=f"商品资料列（默认 {DEFAULT_DATA_COL}）")
+    ap.add_argument("--model-col", default=None,
+                    help="机型列（默认读 required_words.yaml 的 model_column，通常是 D）")
     ap.add_argument("--name-col", default=None,
                     help="商品名称列：列字母或表头文字（默认写在图片右侧单元格）")
     ap.add_argument("--out", default=None, help="输出路径（默认原地写入并自动备份）")
@@ -185,7 +190,29 @@ def main():
         print("❌ Ollama 服务不可用，请先启动：")
         print('   "C:\\Users\\fucker\\AppData\\Local\\Programs\\Ollama\\ollama.exe" serve')
         return 1
-    print("✓ 环境就绪\n")
+    print("✓ 环境就绪")
+
+    # 配置自检：必填词与违禁词不能互相冲突
+    conflicts = check_word_conflicts(required_cfg, confs["forbidden"])
+    if conflicts:
+        print("\n⚠️  配置冲突（同一个词既要求出现、又被列为违禁）：")
+        for rw, f in conflicts[:10]:
+            print(f"     「{rw}」 与违禁词「{f}」冲突")
+        print("   请到 config/ 下修正后再运行，否则这些行会一直判定不合格。")
+        return 1
+
+    # 配置自检：模板里机型槽位不能相邻（否则机型会连成一串）
+    patterns = (rules.get("structure") or {}).get("patterns") or []
+    bad_pat = check_pattern_models_separated(patterns)
+    if bad_pat:
+        print("\n⚠️  组装模板配置有误：以下模板的机型槽位直接相邻，会导致机型连成一串：")
+        for i in bad_pat:
+            print(f"     第 {i + 1} 个模板: {patterns[i]}")
+        print("   请在相邻的机型槽位之间插入一个关键词槽位（如 keywords_a）。")
+        return 1
+
+    print("✓ 词库配置无冲突")
+    print("✓ 组装模板机型间隔正常\n")
 
     # ---------- 1. 提取单元格内图片 ----------
     items, notes = extract(xlsx, img_dir)
@@ -217,13 +244,15 @@ def main():
 
     ncol, nsrc = resolve_col(args.name_col, cells, DEFAULT_NAME_HEADERS,
                              default_col=default_name_col)
+    mcol = (args.model_col or required_cfg.get("model_column") or "D").upper()
     print(f"商品资料列: {args.data_col.upper()} 列")
+    print(f"机型列    : {mcol} 列")
     print(f"图片列    : {img_col} 列")
     print(f"名称写入列: {ncol} 列  ← {nsrc}"
           f"{'（图片右侧）' if ncol == default_name_col else ''}")
 
-    if ncol == img_col:
-        print(f"\n❌ 名称列（{ncol}）与图片列（{img_col}）冲突，拒绝写入以免破坏图片。")
+    if ncol in (img_col, mcol):
+        print(f"\n❌ 名称列（{ncol}）与图片列/机型列冲突，拒绝写入。")
         return 1
 
     # ---------- 3. 逐行生成 ----------
@@ -235,28 +264,37 @@ def main():
     used_padding = set()
     avoid_repeat = bool(diff_cfg.get("avoid_repeat_padding", True))
     do_rotate = bool(diff_cfg.get("rotate_keywords", True))
+    # 差异化只跟踪「运营词库」用过的词（模型特征词是商品特有的，不参与去重）
+    bank_set = set(collect_bank_words(required_cfg))
     t0 = time.time()
 
     for i, row in enumerate(rows, start=1):
         it = row_img[row]
         data_ref = f"{args.data_col.upper()}{row}"
+        model_ref = f"{mcol}{row}"
         row_data = cells.get(data_ref) or ""
+        models_text = cells.get(model_ref) or ""
         print(f"[{i}/{len(rows)}] 第 {row} 行 | 图片 {os.path.basename(it['path'])}")
         if row_data:
             shown = str(row_data)
-            print(f"    资料 {data_ref} = {shown[:66]}{'...' if len(shown) > 66 else ''}")
+            print(f"    资料 {data_ref} = {shown[:60]}{'...' if len(shown) > 60 else ''}")
+        if models_text:
+            print(f"    机型 {model_ref} = {models_text}")
         else:
-            print(f"    资料 {data_ref} = （空）")
+            print(f"    机型 {model_ref} = （空，将从商品资料里解析）")
 
         res = generate_one(
             cfg, confs, it["path"], row_data,
             exclude_padding=used_padding if avoid_repeat else None,
             rotate=(i - 1) if do_rotate else 0,
+            models_text=models_text,
         )
-        used_padding |= set(res["used"] or [])
+        # 差异化：只记录「运营词库」用掉的词，供后续商品避开
+        used_padding |= {w for w in (res["used"] or []) if w in bank_set}
 
         attrs = res["attrs"]
-        print(f"    解析 → 机型 {attrs.get('model') or '（无）'} | "
+        ms = attrs.get("models") or []
+        print(f"    解析 → 机型 {('/'.join(ms)) if ms else '（无）'} | "
               f"材质 {attrs.get('material') or '（无）'} | "
               f"系列 {attrs.get('series') or '（无）'}")
 

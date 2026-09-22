@@ -39,42 +39,68 @@ model_keyword:
     - "折叠屏"
 
 # ---------- 结构组装顺序 ----------
-# 说明：
-#   固定段（机型段/核心词段/材质词）承载全部必填词，是"必现"的；
-#   但它们的**先后位置可以轮换**，模型特征词也能插到不同位置，
-#   这样标题前半段就不会千篇一律。
+# 说明（对齐真实生产标题的写法）：
+#   1. 机型来自表格的「机型列」（默认 D 列），第一个带「苹果」、第二个带「iPhone」、
+#      其余裸写，**穿插在属性词之间**，既覆盖全机型搜索词又不显堆砌
+#   2. 三个必填词拆开分布：手机壳约 22% 位置、新款约 48%、防摔约 74%
+#   3. 固定段（承载必填词）无论怎么排都不会丢
 #
 # 可用槽位：
-#   model_prefix  —— 适用苹果{机型}（提供「苹果」「iPhone」「机型」）
-#   core_suffix   —— 新款手机壳防摔（提供「新款」「手机壳」「防摔」）
+#   model_0       —— 适用于苹果{第1个机型}（提供「苹果」）
+#   model_1       —— iPhone{第2个机型}（提供「iPhone」）
+#   model_n       —— 裸机型，按出现顺序依次取第 3、4、5… 个
+#   core_word     —— 手机壳
+#   new_word      —— 新款
+#   protect_word  —— 防摔
 #   material      —— 材质词
-#   keywords      —— 模型特征关键词（全部）
-#   keywords_a    —— 模型特征关键词（前半）
-#   keywords_b    —— 模型特征关键词（后半）
+#   feature       —— 条件特征词（如磁吸magsafe、支架）
+#   keywords / keywords_a / keywords_b —— 模型特征词 + 运营词库
 #   padding       —— 补足词（永远放最后，用于凑满长度）
 structure:
   # 组装模板：按行轮换（第 1 行用第 1 个，第 2 行用第 2 个……循环）
-  # 每个模板都必须包含全部固定段，否则必填词会缺失
+  #
+  # ★ 硬性要求：任何两个机型槽位之间**必须隔开**（至少夹一个关键词槽位），
+  #   否则机型会连成一串（如「适用于苹果18iPhone1716ProMax手机壳…」）。
+  #   写新模板时务必遵守这条。
   patterns:
-    # 1 特征前置：开头就是图案风格词
-    - [keywords_a, model_prefix, core_suffix, keywords_b, material, padding]
-    # 2 经典式：机型 + 核心词 + 材质 + 特征
-    - [model_prefix, core_suffix, material, keywords, padding]
-    # 3 特征夹心：机型 + 特征 + 核心词 + 特征 + 材质
-    - [model_prefix, keywords_a, core_suffix, keywords_b, material, padding]
-    # 4 核心词前置
-    - [core_suffix, model_prefix, keywords_a, material, keywords_b, padding]
-    # 5 材质提前
-    - [model_prefix, material, keywords_a, core_suffix, keywords_b, padding]
-    # 6 特征前置 + 核心词居中
-    - [keywords_a, core_suffix, model_prefix, keywords_b, material, padding]
+    # 1 机型穿插式（最贴近真实写法）
+    - [model_0, keywords_a, core_word, model_1, keywords_b, model_n, keywords_a,
+       model_n, new_word, keywords_b, model_n, protect_word, keywords_a, model_n,
+       feature, material, padding]
+
+    # 2 机型穿插 · 核心词后置
+    - [model_0, keywords_a, model_1, keywords_b, model_n, keywords_a, core_word,
+       model_n, keywords_b, new_word, model_n, protect_word, keywords_a, model_n,
+       feature, material, padding]
+
+    # 3 属性词前置
+    - [keywords_a, model_0, keywords_b, model_1, core_word, model_n, keywords_a,
+       new_word, model_n, keywords_b, protect_word, model_n, keywords_a, model_n,
+       feature, material, padding]
+
+    # 4 机型夹心
+    - [model_0, keywords_a, model_1, core_word, keywords_b, model_n, new_word,
+       keywords_a, model_n, protect_word, keywords_b, model_n, keywords_a,
+       feature, material, padding]
+
+    # 5 经典式（机型少时退化用）
+    - [model_0, keywords_a, core_word, model_1, new_word, keywords_b,
+       protect_word, model_n, keywords, feature, material, padding]
+
   # 兜底模板（配置有误或未启用轮换时使用）
-  default_pattern: [model_prefix, core_suffix, material, keywords, padding]
+  default_pattern: [model_0, keywords_a, core_word, model_1, keywords_b, new_word,
+                    protect_word, keywords, feature, material, padding]
 
   # 是否启用模板轮换
   rotate_patterns: true
   # 固定段内部顺序是否也参与轮换（进一步降低雷同感）
   rotate_segments: false
+
+  # ★ 模型特征词的字符配额（占目标长度的百分比）
+  # 模型看图输出的特征词（颜色/图案/风格）最多占这么多，
+  # 剩下的长度留给运营词库（主推词/搜索词/卖点词/精准词）。
+  # 设为 0 表示不限制，设为 15 表示最多占 15%（100 字符 → 15 字符）
+  model_keyword_quota: 15
 
 # ---------- 差异化策略（要求：商品名称尽量不要重复）----------
 differentiation:

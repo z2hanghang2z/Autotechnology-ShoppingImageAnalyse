@@ -59,6 +59,38 @@ def all_forbidden_words(forbidden_cfg):
     return words
 
 
+def check_word_conflicts(required_cfg, forbidden_cfg):
+    """
+    检查配置冲突：同一个词同时出现在「必填/条件必含/词库」与「违禁词」里。
+
+    这类冲突会让程序自相矛盾（一边强制加、一边判定违规），
+    实测踩过一次（「支架」既在禁止词库、又在条件必含词里）。
+    返回 [(被要求出现的词, 命中的违禁词), ...]
+    """
+    fw = [w for w in all_forbidden_words(forbidden_cfg) if w]
+
+    required_words = []
+    required_words += [str(x) for x in (required_cfg.get("must_include") or [])]
+    required_words += [str(x) for x in (required_cfg.get("material_group") or [])]
+    for rule in (required_cfg.get("conditional_words") or []):
+        if isinstance(rule, dict) and rule.get("must_include"):
+            required_words.append(str(rule["must_include"]))
+    banks = required_cfg.get("word_banks") or {}
+    for v in banks.values():
+        if isinstance(v, list):
+            required_words += [str(x) for x in v]
+
+    conflicts, seen = [], set()
+    for rw in required_words:
+        for f in fw:
+            if rw and f and (f == rw or f in rw):
+                key = (rw, f)
+                if key not in seen:
+                    seen.add(key)
+                    conflicts.append(key)
+    return conflicts
+
+
 # ---------------------------------------------------------------- 长度计算
 
 def count_length(text, count_mode="char"):
@@ -332,20 +364,109 @@ def pick_material(model_material, keyword_text, required_cfg):
     return ""
 
 
-def build_segments(model_name, material, required_cfg):
+def collect_bank_words(required_cfg):
+    """
+    按优先级收集四类运营词库的词：
+        主推词 → 搜索词 → 卖点词 → 精准词
+    返回去重后的有序列表。顺序决定组装时的取用优先级。
+    """
+    banks = required_cfg.get("word_banks") or {}
+    order = banks.get("priority") or [
+        "main_words", "search_words", "selling_words", "precise_words"
+    ]
+    out = []
+    for key in order:
+        for w in (banks.get(key) or []):
+            w = str(w).strip()
+            if w and w not in out:
+                out.append(w)
+    return out
+
+
+def detect_features(row_data, model_keywords, required_cfg):
+    """
+    判定商品具备哪些特征，返回**必须包含**的特征词列表。
+
+    判定来源（任一命中即算具备）：
+        detect_in_data     —— 商品资料（表格第一列）文本
+        detect_in_keywords —— 视觉模型看图输出的关键词
+
+    例：资料里含「支点」→ 判定为支架 → 返回 ['支架']
+        模型关键词里含「磁吸」→ 判定为磁吸 → 返回 ['磁吸magsafe']
+    """
+    rules = required_cfg.get("conditional_words") or []
+    data_text = str(row_data or "")
+    kw_text = " ".join(str(k) for k in (model_keywords or []))
+    out = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        hit = False
+        for w in (rule.get("detect_in_data") or []):
+            if w and w in data_text:
+                hit = True
+                break
+        if not hit:
+            for w in (rule.get("detect_in_keywords") or []):
+                if w and w in kw_text:
+                    hit = True
+                    break
+        if hit:
+            word = str(rule.get("must_include") or "").strip()
+            if word and word not in out:
+                out.append(word)
+    return out
+
+
+def build_segments(model_name, material, required_cfg, feature_words=None, models=None):
     """
     构造固定段（承载全部必填词），返回 {槽位名: 文本}。
 
+    models —— 机型列表（规范化后，如 ['iPhone18','iPhone17','iPhone16']）
+              不传则从 model_name 拆
+
     槽位说明：
-        model_prefix —— 适用苹果{机型}（提供「苹果」「iPhone」「机型」）
-        core_suffix  —— 新款手机壳防摔（提供「新款」「手机壳」「防摔」）
-        material     —— 材质词（可能为空）
+        model_0      适用于苹果{第1个机型}（提供「苹果」）
+        model_1      iPhone{第2个机型}（提供「iPhone」）
+        model_2...   第 3 个起的裸机型（穿插用）
+        core_word    手机壳
+        new_word     新款
+        protect_word 防摔
+        material     材质词（可能为空）
+        feature      条件特征词（如「磁吸magsafe」「支架」，可能为空）
     """
     seg = {}
-    tpl = required_cfg.get("model_template", "适用苹果{model}")
-    seg["model_prefix"] = tpl.format(model=model_name) if model_name else "适用苹果iPhone"
+    if not models:
+        models = split_models(model_name) if model_name else []
+
+    tpl = required_cfg.get("model_template", "适用于苹果{model}")
+    tpl_ip = required_cfg.get("model_template_iphone", "iPhone{model}")
+
+    def _suffix(m):
+        return re.sub(r"^iPhone", "", m or "")
+
+    if not models:
+        seg["model_0"] = tpl.format(model="iPhone")
+    elif len(models) == 1:
+        # 只有一个机型时，第一段同时带上「苹果」和「iPhone」
+        seg["model_0"] = tpl.format(model=models[0])
+    else:
+        seg["model_0"] = tpl.format(model=_suffix(models[0]))
+        seg["model_1"] = tpl_ip.format(model=_suffix(models[1]))
+        for i, m in enumerate(models[2:], start=2):
+            seg[f"model_{i}"] = _suffix(m)
+
+    # 必填词拆位（对齐真实标题的分布：手机壳 22%、新款 48%、防摔 74%）
+    seg["core_word"] = required_cfg.get("core_word", "手机壳")
+    seg["new_word"] = required_cfg.get("new_word", "新款")
+    seg["protect_word"] = required_cfg.get("protect_word", "防摔")
+    # 组合式 + 旧槽位名，兼容老模板
     seg["core_suffix"] = required_cfg.get("core_template", "新款手机壳防摔")
+    seg["model_prefix"] = seg["model_0"]
+
     seg["material"] = material or ""
+    fw = [w for w in (feature_words or []) if w]
+    seg["feature"] = "".join(fw) if fw else ""
     return seg
 
 
@@ -408,172 +529,30 @@ def find_punctuation(text):
     return sorted(set(PUNCT_RE.findall(text or "")))
 
 
-def _resolve_pattern(pattern, segments, keywords):
+def check_pattern_models_separated(patterns):
     """
-    把模板展开成有序的「段」列表：
-        [("text", 文本), ("kwlist", [关键词...]), ...]
-    支持 keywords / keywords_a / keywords_b 三种关键词槽位。
+    检查组装模板里是否有「两个机型槽位直接相邻」的情况。
+
+    相邻会导致机型连成一串，例如：
+        适用于苹果18iPhone1716ProMax手机壳…
+    正确写法是中间夹一个关键词槽位，让机型穿插在属性词之间。
+
+    返回有问题的模板下标列表（空 = 全部合规）。
     """
-    kws = list(keywords or [])
-    kw_slots = {}
-    if "keywords_a" in pattern or "keywords_b" in pattern:
-        mid = (len(kws) + 1) // 2
-        kw_slots["keywords_a"] = kws[:mid]
-        kw_slots["keywords_b"] = kws[mid:]
-    if "keywords" in pattern:
-        kw_slots["keywords"] = kws
-
-    out = []
-    for slot in pattern:
-        if slot in kw_slots:
-            out.append(("kwlist", kw_slots[slot]))
-        elif slot == "padding":
-            out.append(("padding", None))
-        else:
-            txt = segments.get(slot, "")
-            if txt:
-                out.append(("text", txt))
-    return out
-
-
-def assemble_exact(segments, keywords, padding_pool, target,
-                   count_mode="char", exclude_words=None, rotate=0, pattern=None):
-    """
-    按模板精确组装到 target 长度（按 count_mode 口径），且绝不切断词语。
-
-    segments —— 固定段字典（见 build_segments）
-    pattern  —— 槽位顺序列表；None 时用默认顺序
-
-    步骤：
-        1. 按模板顺序铺固定段，关键词插到对应的关键词槽（放不下就跳过）
-        2. 剩余缺口用补足词池做子集和，找出正好填满的组合
-        3. 无法精确命中时，从实际用上的关键词末尾逐步去掉再重试（调整长度奇偶性）
-        4. 仍不行则取最接近的组合
-
-    返回 (标题, 是否精确命中, 使用的词列表)
-    """
-    W = lambda s: count_length(s, count_mode)
-    exclude = set(exclude_words or {})
-
-    if not pattern:
-        pattern = ["model_prefix", "core_suffix", "material", "keywords", "padding"]
-
-    kws = list(keywords or [])
-    if rotate and kws:
-        r = rotate % len(kws)
-        kws = kws[r:] + kws[:r]
-
-    # 按模板铺开（关键词槽内做贪心筛选）
-    layout = _resolve_pattern(pattern, segments, kws)
-
-    # ★ 关键：固定段（机型/核心词/材质）承载必填词，必须优先保证放得下。
-    #   先把所有固定段的总长度算出来，加关键词时给它留够余量，
-    #   否则模板把固定段放在后面时，前面的关键词会吃光预算导致必填词被截断。
-    total_text_w = sum(W(v) for k, v in layout if k == "text")
-
-    base = ""
-    used = []
-    text_used = 0
-    for kind, val in layout:
-        if kind == "text":
-            base = join_text(base, val)
-            text_used += W(val)
-        elif kind == "kwlist":
-            remaining_text = total_text_w - text_used   # 后面还没放的固定段长度
-            for kw in val:
-                if not kw or kw in used:
-                    continue
-                # 会造成英文粘连的词直接跳过（不能用分隔符，只能不选它）
-                if not can_join(base, kw):
-                    continue
-                cand = join_text(base, kw)
-                if W(cand) + remaining_text <= target:
-                    base = cand
-                    used.append(kw)
-
-    def _fill(trial_words):
-        """给定「本次采用的关键词」，按模板重建标题并尝试补满缺口"""
-        tw = set(trial_words)
-        t = ""
-        for kind, val in layout:
-            if kind == "text":
-                t = join_text(t, val)
-            elif kind == "kwlist":
-                for kw in val:
-                    if kw in tw and can_join(t, kw):
-                        t = join_text(t, kw)
-        gap = target - W(t)
-        if gap < 0:
-            out = trim_to_weight(t, target, count_mode)
-            return out, W(out) == target, list(trial_words)
-        if gap == 0:
-            return t, True, list(trial_words)
-
-        # 补足词池：排除已用与近义重复；跨商品用过的排后面（差异化）
-        cand = []
-        for w in (padding_pool or []):
-            if not w or w in trial_words:
-                continue
-            if W(w) > gap:
-                continue
-            if not can_join(t, w):          # 会造成英文粘连 → 不用
-                continue
-            if is_near_duplicate(w, trial_words) or is_near_duplicate(w, cand):
-                continue
-            cand.append(w)
-        preferred = [w for w in cand if w not in exclude]
-        fallback = [w for w in cand if w in exclude]
-        cand = preferred + fallback
-        if rotate and cand:
-            r = rotate % len(cand)
-            cand = cand[r:] + cand[:r]
-
-        dp = {0: []}
-        for w in cand:
-            L = W(w)
-            for s in sorted(dp.keys(), reverse=True):
-                ns = s + L
-                if ns <= gap and ns not in dp:
-                    dp[ns] = dp[s] + [w]
-            if gap in dp:
+    bad = []
+    for i, pat in enumerate(patterns or []):
+        prev_is_model = False
+        for slot in (pat or []):
+            is_model = str(slot).startswith("model_")
+            if is_model and prev_is_model:
+                bad.append(i)
                 break
-        if gap in dp:
-            fill = dp[gap]
-            out = t
-            for w in fill:
-                out = join_text(out, w)
-            return out, True, list(trial_words) + fill
-
-        best = max(dp.keys()) if dp else 0
-        tail = dp.get(best, [])
-        t2 = t
-        for w in tail:
-            t2 = join_text(t2, w)
-        need = target - W(t2)
-        if need > 0:
-            for w in cand:
-                if w in trial_words or w in tail:
-                    continue
-                piece = trim_to_weight(w, need, count_mode)
-                if piece and len(piece) >= 2 and W(piece) == need and can_join(t2, piece):
-                    return join_text(t2, piece), True, list(trial_words) + tail
-        return t2, W(t2) == target, list(trial_words) + tail
-
-    best_result = None
-    for drop in range(0, min(len(used), 6) + 1):
-        trial = used[: len(used) - drop] if drop else used
-        title, exact, final_used = _fill(trial)
-        if exact:
-            return title, True, final_used
-        if best_result is None or W(title) > W(best_result[0]):
-            best_result = (title, exact, final_used)
-
-    if best_result:
-        return best_result
-    return "".join(v for k, v in layout if k == "text"), False, []
+            prev_is_model = is_model
+    return bad
 
 
 def _bigrams(s):
+    """取 2 字组合集合，用于判断两词是否语义重叠"""
     s = s or ""
     if len(s) < 2:
         return {s} if s else set()
@@ -603,6 +582,180 @@ def is_near_duplicate(kw, existing, min_prefix=2):
     return False
 
 
+def _resolve_pattern(pattern, segments, keywords):
+    """
+    把模板展开成有序的「段」列表：
+        [("text", 文本), ("kw", None), ("padding", None)]
+
+    - 每个 ("kw", None) 是一个**关键词槽位**，组装时按顺序从同一个词池里取词，
+      所以同一个词不会被重复放进标题
+    - `model_n` 按出现顺序展开成 model_2 / model_3 / …（机型不够时自动跳过）
+    - 条件特征词（feature）若不在模板里，自动插到核心词段之后
+    """
+    pattern = list(pattern or [])
+
+    # 1) 展开 model_n
+    pat, idx = [], 2
+    for slot in pattern:
+        if slot == "model_n":
+            pat.append(f"model_{idx}")
+            idx += 1
+        else:
+            pat.append(slot)
+    pattern = pat
+
+    # 2) 条件特征词自动补位
+    if segments.get("feature") and "feature" not in pattern:
+        pat2, inserted = [], False
+        for slot in pattern:
+            pat2.append(slot)
+            if slot in ("core_word", "core_suffix") and not inserted:
+                pat2.append("feature")
+                inserted = True
+        if not inserted:
+            pat2.insert(0, "feature")
+        pattern = pat2
+
+    # 3) 展开成 layout
+    out = []
+    for slot in pattern:
+        if slot in ("kw", "keywords", "keywords_a", "keywords_b"):
+            out.append(("kw", None))
+        elif slot == "padding":
+            out.append(("padding", None))
+        else:
+            txt = segments.get(slot, "")
+            if txt:
+                out.append(("text", txt))
+    return out
+
+
+def assemble_exact(segments, keywords, padding_pool, target,
+                   count_mode="char", exclude_words=None, rotate=0, pattern=None):
+    """
+    按模板精确组装到 target 长度（按 count_mode 口径），且绝不切断词语。
+
+    ★ 关键词槽位依次消费同一个词池 —— 每个词只会被用一次，不会重复出现。
+    ★ 固定段（机型/手机壳/新款/防摔/材质/特征）必须放得下，加关键词时会预留余量。
+
+    返回 (标题, 是否精确命中, 使用的词列表)
+    """
+    W = lambda s: count_length(s, count_mode)
+    exclude = set(exclude_words or {})
+
+    if not pattern:
+        pattern = ["model_0", "model_1", "core_word", "new_word",
+                   "protect_word", "keywords", "feature", "material", "padding"]
+
+    kws = list(keywords or [])
+    if rotate and kws:
+        r = rotate % len(kws)
+        kws = kws[r:] + kws[:r]
+
+    layout = _resolve_pattern(pattern, segments, kws)
+    # 固定段总长度：用来给还没放的关键词预留余量，保证必填词不被截断
+    total_text_w = sum(W(v) for k, v in layout if k == "text")
+
+    def _build(trial_words):
+        """按模板铺开；关键词从 trial_words 里按槽位顺序依次取"""
+        t = ""
+        text_done = 0
+        picked, qi = [], 0
+        for kind, val in layout:
+            if kind == "text":
+                t = join_text(t, val)
+                text_done += W(val)
+            elif kind == "kw":
+                remaining_text = total_text_w - text_done
+                while qi < len(trial_words):
+                    kw = trial_words[qi]
+                    qi += 1
+                    if not kw or kw in picked:
+                        continue
+                    if not can_join(t, kw):
+                        continue
+                    cand = join_text(t, kw)
+                    if W(cand) + remaining_text <= target:
+                        t = cand
+                        picked.append(kw)
+                        break
+        return t, picked
+
+    def _fill(trial_words):
+        """给定采用的关键词，重建标题并尝试补满缺口"""
+        t, picked = _build(trial_words)
+        gap = target - W(t)
+        if gap < 0:
+            out = trim_to_weight(t, target, count_mode)
+            return out, W(out) == target, picked
+        if gap == 0:
+            return t, True, picked
+
+        # 补足词池：排除已用与近义重复；跨商品用过的排后面（差异化）
+        cand = []
+        for w in (padding_pool or []):
+            if not w or w in picked:
+                continue
+            if W(w) > gap:
+                continue
+            if not can_join(t, w):
+                continue
+            if is_near_duplicate(w, picked) or is_near_duplicate(w, cand):
+                continue
+            cand.append(w)
+        preferred = [w for w in cand if w not in exclude]
+        fallback = [w for w in cand if w in exclude]
+        cand = preferred + fallback
+        if rotate and cand:
+            r = rotate % len(cand)
+            cand = cand[r:] + cand[:r]
+
+        dp = {0: []}
+        for w in cand:
+            L = W(w)
+            for st in sorted(dp.keys(), reverse=True):
+                ns = st + L
+                if ns <= gap and ns not in dp:
+                    dp[ns] = dp[st] + [w]
+            if gap in dp:
+                break
+        if gap in dp:
+            fill = dp[gap]
+            out = t
+            for w in fill:
+                out = join_text(out, w)
+            return out, True, picked + fill
+
+        best = max(dp.keys()) if dp else 0
+        tail = dp.get(best, [])
+        t2 = t
+        for w in tail:
+            t2 = join_text(t2, w)
+        need = target - W(t2)
+        if need > 0:
+            for w in cand:
+                if w in picked or w in tail:
+                    continue
+                piece = trim_to_weight(w, need, count_mode)
+                if piece and len(piece) >= 2 and W(piece) == need and can_join(t2, piece):
+                    return join_text(t2, piece), True, picked + tail
+        return t2, W(t2) == target, picked + tail
+
+    best_result = None
+    # 依次尝试：先用全部关键词 → 逐步去掉末尾关键词（调整长度奇偶性）
+    for drop in range(0, min(len(kws), 6) + 1):
+        trial = kws[: len(kws) - drop] if drop else kws
+        title, exact, final_used = _fill(trial)
+        if exact:
+            return title, True, final_used
+        if best_result is None or W(title) > W(best_result[0]):
+            best_result = (title, exact, final_used)
+
+    if best_result:
+        return best_result
+    return "", False, []
+
+
 # ---------------------------------------------------------------- 差异化
 
 def title_similarity(a, b):
@@ -628,8 +781,12 @@ def pairwise_similarity(titles):
 
 # ---------------------------------------------------------------- 校验
 
-def validate_title(title, model_name, rules, required_cfg, forbidden_cfg):
-    """校验标题，返回问题列表（空列表 = 全部通过）"""
+def validate_title(title, model_name, rules, required_cfg, forbidden_cfg, models=None):
+    """
+    校验标题，返回问题列表（空列表 = 全部通过）。
+
+    models —— 机型列表（来自表格机型列）。多机型时逐个检查是否都出现了。
+    """
     issues = []
     vcfg = rules.get("validate", {}) or {}
     lcfg = rules.get("length", {}) or {}
@@ -664,19 +821,15 @@ def validate_title(title, model_name, rules, required_cfg, forbidden_cfg):
             if w and w in title:
                 issues.append(f"含违禁词「{w}」")
 
-    if vcfg.get("check_model_once", True) and model_name:
-        cnt = title.count(model_name)
-        if cnt > 1:
-            issues.append(f"机型「{model_name}」出现 {cnt} 次（要求仅 1 次）")
-        if cnt == 0:
-            issues.append(f"机型「{model_name}」未出现")
-        # 多机型：合并后第一段带 iPhone 前缀，后续段不带，
-        # 所以检查后续段时要先剥掉 iPhone 前缀
-        models = split_models(model_name)
-        for m in models[1:]:
-            suffix = re.sub(r"^iPhone", "", m)
-            if suffix and suffix not in title:
+    if vcfg.get("check_model_once", True):
+        ms = list(models) if models else split_models(model_name)
+        # 每个机型都要出现（第 1 个带「苹果」、第 2 个带「iPhone」、其余裸写，
+        # 所以统一剥掉 iPhone 前缀再比对）
+        for m in ms:
+            suf = re.sub(r"^iPhone", "", m)
+            if suf and suf not in title:
                 issues.append(f"机型「{m}」未出现")
+        # 「苹果」「iPhone」各只能出现一次
         for brand in ["iPhone", "苹果"]:
             c = title.count(brand)
             if c > 1:
