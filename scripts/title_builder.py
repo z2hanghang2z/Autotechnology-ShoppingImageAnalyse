@@ -167,37 +167,185 @@ def extract_attrs(row_data, material_group=None):
     return {"series": series, "material": material, "model": model}
 
 
-_MODEL_TAIL_WORDS = ["支点", "手机壳", "保护套", "壳", "主图", "详情图", "款", "系列"]
+_MODEL_TAIL_WORDS = [
+    "支点", "手机壳", "保护套", "壳", "主图", "详情图", "款", "系列",
+]
+# ⚠️ 「典藏版 / 限量版」这类**版本名不算尾部修饰词**，必须保留：
+#    用户明确「华为puraXMax/华为puraXMax典藏版」是**两个机型**，
+#    标题里两个都要出现（典藏版是独立 SKU，属正常适配机型）。
 
-# 机型 token：两位数字 + 可选后缀（18u / 17promax / 16pro / 15 / 14plus ...）
-_MODEL_TOKEN_RE = re.compile(
-    r"(\d{2})\s*(promax|pro|plus|mini|max|air|ultra|duo|se|u|e)?", re.I
-)
+# ============================================================
+# 品牌表
+# ============================================================
+# 背景：本类目不只卖苹果壳，机型列会出现华为等其它品牌。
+#       品牌必须按**实际机型**判定，绝不能所有商品都写「苹果」。
+#       真实配置在 config/required_words.yaml → brands；
+#       这里只是 required_cfg 缺失时的兜底，避免函数签名被 cfg 污染。
+_FALLBACK_BRANDS = {
+    "苹果": {
+        "aliases": ["苹果", "iPhone", "iphone", "IPHONE", "Iphone"],
+        "title_template_single": "适用于苹果iPhone{model}",
+        "title_template": "适用于苹果{model}",
+        "title_template_2": "iPhone{model}",
+        "title_template_n": "{model}",
+        "brand_words": ["苹果", "iPhone"],
+        "require_brand_words": True,
+    },
+    "华为": {
+        "aliases": ["华为", "huawei", "HUAWEI", "Huawei", "HW", "hw"],
+        "title_template_single": "适用华为{model}",
+        "title_template": "适用华为{model}",
+        "title_template_2": "{model}",
+        "title_template_n": "{model}",
+        "brand_words": ["华为"],
+        "require_brand_words": True,
+    },
+}
+
+# 机型后缀别名兜底（真实配置在 required_words.yaml → model_suffix_aliases）
+_FALLBACK_SUFFIX_ALIASES = {
+    "pm": "ProMax", "p": "Pro", "promax": "ProMax", "pro": "Pro",
+    "plus": "Plus", "mini": "Mini", "max": "Max", "air": "Air",
+    "ultra": "Ultra", "duo": "Duo", "se": "SE", "u": "U", "e": "E",
+}
+
+_DEFAULT_BRAND = "苹果"
 
 
-def _clean_model_token(digits, suffix):
-    """把「18」「u」拼成 iPhone18U"""
-    s = digits
-    if suffix:
-        sfx = suffix.lower()
-        # 复合后缀特殊处理
-        cap = {"promax": "ProMax", "promini": "ProMini"}.get(sfx)
-        if not cap:
-            cap = sfx[0].upper() + sfx[1:]
-        s += cap
-    return "iPhone" + s
+def _get_brands(required_cfg=None):
+    """取品牌表（配置优先，缺失时用兜底表）"""
+    table = (required_cfg or {}).get("brands")
+    return table if isinstance(table, dict) and table else _FALLBACK_BRANDS
 
 
-def _has_model_token(s):
-    """这一段里是否含机型特征（数字+后缀，或 iphone/苹果 前缀）"""
+def _get_suffix_aliases(required_cfg=None):
+    """取机型后缀别名表（配置优先，缺失时用兜底表）"""
+    table = (required_cfg or {}).get("model_suffix_aliases")
+    return table if isinstance(table, dict) and table else _FALLBACK_SUFFIX_ALIASES
+
+
+def _build_model_token_re(aliases):
+    """按别名表生成机型 token 正则（长别名优先，避免 pro 抢在 promax 前面）"""
+    keys = sorted((k for k in aliases if k), key=len, reverse=True)
+    alt = "|".join(re.escape(k) for k in keys)
+    return re.compile(r"(\d{2})\s*(" + alt + r")?", re.I)
+
+
+_MODEL_TOKEN_RE = _build_model_token_re(_FALLBACK_SUFFIX_ALIASES)
+
+
+def _cap_suffix(sfx, aliases):
+    """后缀规范化：pm -> ProMax、promax -> ProMax、u -> U"""
+    if not sfx:
+        return ""
+    return aliases.get(sfx.lower()) or (sfx[0].upper() + sfx[1:])
+
+
+def _brand_aliases(required_cfg=None):
+    """全部品牌别名，按长度降序（长别名优先，避免「iphone」被「ip」之类抢先）"""
+    out = []
+    for cfg in _get_brands(required_cfg).values():
+        out += [a for a in (cfg.get("aliases") or []) if a]
+    return sorted(set(out), key=len, reverse=True)
+
+
+def _has_brand(s, required_cfg=None):
+    """文本里是否出现任何品牌别名"""
+    t = str(s or "").lower()
+    return any(a.lower() in t for a in _brand_aliases(required_cfg))
+
+
+def strip_brand_prefix(s, required_cfg=None):
+    """
+    剥掉机型字符串**开头**的品牌前缀。
+        iPhone18U  -> 18U
+        苹果18U     -> 18U
+        华为PuraXMax -> PuraXMax
+    """
+    t = str(s or "").strip()
+    changed = True
+    while changed:
+        changed = False
+        for a in _brand_aliases(required_cfg):
+            if len(t) > len(a) and t.lower().startswith(a.lower()):
+                t = t[len(a):]
+                changed = True
+                break
+    return t
+
+
+def detect_brand(spec, required_cfg=None):
+    """
+    在机型文本里识别品牌，返回品牌名（如「苹果」「华为」）。
+
+    传 list 时按整体文本判定（一个商品只有一个品牌）。
+    都没命中则返回 default_brand（默认苹果，兼容 18U 这类裸机型写法）。
+    """
+    if isinstance(spec, (list, tuple)):
+        s = " ".join(str(x) for x in spec)
+    else:
+        s = str(spec or "")
+    default = (required_cfg or {}).get("default_brand") or _DEFAULT_BRAND
+    if not s:
+        return default
+    low = s.lower()
+    best_name, best_len = None, -1
+    for name, cfg in _get_brands(required_cfg).items():
+        for a in (cfg.get("aliases") or []):
+            if a and a.lower() in low and len(a) > best_len:
+                best_name, best_len = name, len(a)
+    return best_name or default
+
+
+def brand_words_of(brand, required_cfg=None):
+    """取某品牌在标题里承载的品牌词（用于重复出现检查 / 关键词去重）"""
+    cfg = _get_brands(required_cfg).get(brand) or {}
+    return [w for w in (cfg.get("brand_words") or []) if w]
+
+
+# 机型列里可能混入材质，用这些分隔符切开（实测写法「素皮、华为puraXMax/…」）
+_MATERIAL_SPLIT_RE = re.compile(r"[、,，;；]")
+
+
+def strip_material_prefix(spec, required_cfg=None):
+    """
+    剥掉机型列里的材质前缀，只留下机型部分。
+
+    实测机型列常写成「素皮、华为puraXMax/华为puraXMax典藏版」——
+    材质 + 顿号 + 机型列表。材质不是机型，必须先剔除，
+    否则品牌识别和机型解析都会被带偏（这正是 Duo 解析不出来的原因）。
+
+    判据：按分隔符切开后，只保留「像机型」的段
+          （含品牌别名，或含数字机型 token）。
+    """
+    if not spec:
+        return ""
+    s = str(spec).strip()
+    if not _MATERIAL_SPLIT_RE.search(s):
+        return s
+    parts = [p.strip() for p in _MATERIAL_SPLIT_RE.split(s) if p.strip()]
+    if len(parts) < 2:
+        return s
+    keep = [
+        p for p in parts
+        if _has_brand(p, required_cfg) or _MODEL_TOKEN_RE.search(p)
+    ]
+    return "".join(keep)
+
+
+def _has_model_token(s, required_cfg=None):
+    """这一段里是否含机型特征（数字+后缀，或品牌前缀）"""
     if not s:
         return False
-    if re.match(r"(?i)^(iphone|苹果)", s.strip()):
+    if _has_brand(s, required_cfg):
         return True
-    return bool(_MODEL_TOKEN_RE.search(s))
+    rex = _MODEL_TOKEN_RE if not required_cfg else \
+        _build_model_token_re(_get_suffix_aliases(required_cfg))
+    return bool(rex.search(s))
 
 
-def _looks_like_path(s):
+
+def _looks_like_path(s, required_cfg=None):
     """
     判断是不是文件路径。
     难点：斜杠既可能是路径分隔符，也可能是机型分隔符（如「15/16promax」）。
@@ -212,35 +360,41 @@ def _looks_like_path(s):
     if "/" not in s:
         return False
     segs = [p.strip() for p in s.split("/") if p.strip()]
-    if len(segs) >= 2 and all(_has_model_token(p) for p in segs):
+    if len(segs) >= 2 and all(_has_model_token(p, required_cfg) for p in segs):
         return False                   # 全是机型 → 机型列表
     return s.count("/") >= 2
 
 
-def split_models(spec):
-    """
-    把机型文本拆成**多个机型**。
-
-    用户约定：路径文本中出现的疑似机型都算适配机型，都要进商品名称。
-    例：
-        '苹果18u17promax'   -> ['iPhone18U', 'iPhone17ProMax']
-        '苹果15/16promax'   -> ['iPhone15', 'iPhone16ProMax']
-        'iPhone Duo'        -> ['iPhoneDuo']
-        'iphone17pro支点'    -> ['iPhone17Pro']
-    """
-    if not spec:
+def _parse_apple_segment(body, required_cfg=None):
+    """苹果机型片段 → ['iPhone18U', ...]（一段里可能含多个机型）"""
+    aliases = _get_suffix_aliases(required_cfg)
+    rex = _build_model_token_re(aliases)
+    out = []
+    for m in rex.finditer(body):
+        out.append("iPhone" + m.group(1) + _cap_suffix(m.group(2), aliases))
+    if out:
+        return out
+    # 无数字机型（Duo / Air / SE / Ultra …）；
+    # 必须看起来像机型才认，避免把目录名（如 images）当成机型
+    t = re.sub(r"[\s/]+", "", body)
+    if not t or not t.isascii():
         return []
-    s = str(spec).strip()
-    if not s:
+    if len(t) > 4 and not re.fullmatch(
+        r"(?i)(duo|air|ultra|se|mini|max|plus|fold|pro|promax)", t
+    ):
         return []
-    # 若是路径，先取出机型段
-    if _looks_like_path(s):
-        s = extract_model_from_path(s)
-        if not s:
-            return []
+    return ["iPhone" + _cap_suffix(t, aliases)]
 
-    # 去掉「苹果 / iPhone」前缀与常见尾部修饰词
-    body = re.sub(r"^(苹果|iPhone|iphone|IPHONE)", "", s)
+
+def _parse_segment(seg, brand, required_cfg=None):
+    """
+    解析单个机型片段，返回该片段含有的全部机型（带品牌前缀）。
+
+    苹果片段可能一次含多个机型（如 '苹果18u17promax' → 18U + 17ProMax），
+    所以返回列表。
+    """
+    body = strip_brand_prefix(seg, required_cfg)
+    # 剥尾部修饰词（典藏版 / 手机壳 / 系列 …）
     changed = True
     while changed:
         changed = False
@@ -248,32 +402,74 @@ def split_models(spec):
             if body.endswith(w) and len(body) > len(w):
                 body = body[: -len(w)]
                 changed = True
+    if not body:
+        return []
+
+    if brand == _DEFAULT_BRAND:
+        return _parse_apple_segment(body, required_cfg)
+
+    # 非苹果品牌：整段当机型名。
+    # 华为等机型是字母数字混排（puraXMax / mate60 / nova12），
+    # 没法用「两位数字 + 后缀」的苹果正则去切，切了反而会切出垃圾。
+    t = re.sub(r"[\s/]+", "", body)
+    if not t:
+        return []
+    return [brand + t[0].upper() + t[1:]]
+
+
+def split_models(spec, required_cfg=None):
+    """
+    把机型文本拆成**多个机型**，返回值带品牌前缀：
+        苹果 -> ['iPhone18U', 'iPhone17ProMax']
+        华为 -> ['华为PuraXMax']
+
+    用户约定：机型列里出现的疑似机型都算适配机型，都要进商品名称。
+
+    例：
+        '苹果18u17promax'                        -> ['iPhone18U','iPhone17ProMax']
+        '苹果15/16promax'                        -> ['iPhone15','iPhone16ProMax']
+        'iPhone Duo'                             -> ['iPhoneDuo']
+        '素皮、华为puraXMax/华为puraXMax典藏版'    -> ['华为PuraXMax']
+        '透明、iPhone18Pro/17ProMax/16/18pm'      -> ['iPhone18Pro','iPhone17ProMax','iPhone16','iPhone18ProMax']
+        '硅胶、iPhone18ProMax/苹果17Pro/17pm/18p' -> ['iPhone18ProMax','iPhone17Pro','iPhone17ProMax','iPhone18Pro']
+    """
+    if not spec:
+        return []
+    s = str(spec).strip()
+    if not s:
+        return []
+
+    # 1. 剥掉「材质、」前缀。
+    #    实测机型列写成「素皮、iPhoneDuo」，材质前缀会挡住品牌识别，
+    #    导致整段解析失败（这就是 Duo 丢失的原因）。
+    s = strip_material_prefix(s, required_cfg)
+    if not s:
+        return []
+
+    # 2. 若是路径，先取出机型段
+    if _looks_like_path(s, required_cfg):
+        s = extract_model_from_path(s)
+        if not s:
+            return []
+
+    # 3. 整段先判一次品牌（一个商品只有一个品牌）
+    brand = detect_brand(s, required_cfg)
+
+    # 4. 切成候选段；切不动就整段交给 token 正则扫
+    segs = [p.strip() for p in re.split(r"[/\s、]+", s) if p.strip()]
+    if not segs:
+        return []
 
     models, seen = [], set()
-    for m in _MODEL_TOKEN_RE.finditer(body):
-        model = _clean_model_token(m.group(1), m.group(2))
-        if model not in seen:
-            seen.add(model)
-            models.append(model)
-
-    # 没匹配到数字机型（如 iPhoneDuo 这类无数字写法），退化为整段处理；
-    # 但必须看起来像机型才认，避免把目录名（如 images）当成机型
-    if not models and body:
-        s2 = re.sub(r"[\s/]+", "", body)
-        plausible = (
-            s2
-            and s2.isascii()
-            and (len(s2) <= 4 or re.fullmatch(r"(?i)(duo|air|ultra|se|mini|max|plus|fold)", s2))
-        )
-        if plausible:
-            s2 = re.sub(r"(?i)(promax|pro|plus|mini|max|air|ultra|duo|u)",
-                        lambda mo: mo.group(0)[0].upper() + mo.group(0)[1:].lower(), s2)
-            s2 = s2.replace("Promax", "ProMax").replace("Promini", "ProMini")
-            models.append("iPhone" + s2)
+    for seg in segs:
+        for m in _parse_segment(seg, brand, required_cfg):
+            if m and m not in seen:
+                seen.add(m)
+                models.append(m)
     return models
 
 
-def format_model_group(models):
+def format_model_group(models, required_cfg=None):
     """
     把多个机型合成标题里的一段。
 
@@ -281,7 +477,7 @@ def format_model_group(models):
        所以多机型直接连写，不加任何分隔符：
            ['iPhone18U', 'iPhone17ProMax'] -> 'iPhone18U17ProMax'
 
-    只保留第一个 iPhone 前缀，避免「iPhone」重复出现。
+    只保留第一个品牌前缀，避免品牌词重复出现。
     """
     models = [m for m in (models or []) if m]
     if not models:
@@ -290,21 +486,22 @@ def format_model_group(models):
         return models[0]
     out = [models[0]]
     for m in models[1:]:
-        out.append(re.sub(r"^iPhone", "", m))
+        out.append(strip_brand_prefix(m, required_cfg))
     return "".join(out)
 
 
-def normalize_model(spec):
+def normalize_model(spec, required_cfg=None):
     """
     机型规范化（返回可用于标题的整段文本，支持多机型）。
 
         iphone16          -> iPhone16
         iPhone 15 Pro     -> iPhone15Pro
-        苹果18u17promax    -> iPhone18U/17ProMax      ← 多机型
+        苹果18u17promax    -> iPhone18U17ProMax     ← 多机型
         iPhone Duo        -> iPhoneDuo
+        华为puraXMax       -> 华为PuraXMax
     """
-    models = split_models(spec)
-    return format_model_group(models)
+    models = split_models(spec, required_cfg)
+    return format_model_group(models, required_cfg)
 
 
 def extract_model_from_path(path):
@@ -422,12 +619,19 @@ def build_segments(model_name, material, required_cfg, feature_words=None, model
     """
     构造固定段（承载全部必填词），返回 {槽位名: 文本}。
 
-    models —— 机型列表（规范化后，如 ['iPhone18','iPhone17','iPhone16']）
+    models —— 机型列表（带品牌前缀，如 ['iPhone18','iPhone17'] 或 ['华为PuraXMax']）
               不传则从 model_name 拆
 
+    品牌由机型列**实际内容**决定（config → brands）：
+        苹果 -> model_0「适用于苹果18」 model_1「iPhone17」 其余裸写
+        华为 -> model_0「适用华为PuraXMax」 其余裸写
+
+    ★ 解析不到机型时 model_0 留空，**绝不编造品牌**——
+      之前这里写死 tpl.format(model="iPhone")，导致华为商品被套上「适用于苹果iPhone」。
+
     槽位说明：
-        model_0      适用于苹果{第1个机型}（提供「苹果」）
-        model_1      iPhone{第2个机型}（提供「iPhone」）
+        model_0      第 1 个机型（带品牌）
+        model_1      第 2 个机型（苹果带「iPhone」，其它品牌裸写）
         model_2...   第 3 个起的裸机型（穿插用）
         core_word    手机壳
         new_word     新款
@@ -437,24 +641,36 @@ def build_segments(model_name, material, required_cfg, feature_words=None, model
     """
     seg = {}
     if not models:
-        models = split_models(model_name) if model_name else []
+        models = split_models(model_name, required_cfg) if model_name else []
 
-    tpl = required_cfg.get("model_template", "适用于苹果{model}")
-    tpl_ip = required_cfg.get("model_template_iphone", "iPhone{model}")
+    brands = _get_brands(required_cfg)
+    # 品牌：优先按机型列表判定，没有机型就按原始文本判（用于报错提示）
+    brand = detect_brand(models or model_name, required_cfg)
+    bcfg = brands.get(brand) or brands.get(_DEFAULT_BRAND) or {}
 
-    def _suffix(m):
-        return re.sub(r"^iPhone", "", m or "")
+    tpl = bcfg.get("title_template", "适用于苹果{model}")
+    tpl2 = bcfg.get("title_template_2", "iPhone{model}")
+    tpln = bcfg.get("title_template_n", "{model}")
+    # 单机型专用模板：苹果要一次带齐「苹果」「iPhone」
+    tpl1 = bcfg.get("title_template_single") or tpl
 
-    if not models:
-        seg["model_0"] = tpl.format(model="iPhone")
-    elif len(models) == 1:
-        # 只有一个机型时，第一段同时带上「苹果」和「iPhone」
-        seg["model_0"] = tpl.format(model=models[0])
+    def _naked(m):
+        return strip_brand_prefix(m, required_cfg)
+
+    if models:
+        if len(models) == 1:
+            # 单机型：用专用模板，苹果要一次带齐「苹果」「iPhone」
+            seg["model_0"] = tpl1.format(model=_naked(models[0]))
+        else:
+            seg["model_0"] = tpl.format(model=_naked(models[0]))
+            seg["model_1"] = tpl2.format(model=_naked(models[1]))
+            for i, m in enumerate(models[2:], start=2):
+                seg[f"model_{i}"] = tpln.format(model=_naked(m))
     else:
-        seg["model_0"] = tpl.format(model=_suffix(models[0]))
-        seg["model_1"] = tpl_ip.format(model=_suffix(models[1]))
-        for i, m in enumerate(models[2:], start=2):
-            seg[f"model_{i}"] = _suffix(m)
+        # ★ 绝不编造机型 / 品牌。留空，由调用方明确报错并跳过该行。
+        seg["model_0"] = ""
+
+    seg["brand"] = brand
 
     # 必填词拆位（对齐真实标题的分布：手机壳 22%、新款 48%、防摔 74%）
     seg["core_word"] = required_cfg.get("core_word", "手机壳")
@@ -604,6 +820,27 @@ def _resolve_pattern(pattern, segments, keywords):
             pat.append(slot)
     pattern = pat
 
+    # 1b) ★ 机型比模板里的槽位多时，补足槽位。
+    #     每个模板的 model_n 数量是固定的（1 个 model_n 只能放 1 个机型），
+    #     机型一多就会「有机型但没槽位」，导致该机型被整个丢掉。
+    #     补位时**每个机型前面插一个关键词槽**，保证机型之间不相邻（机型不连写）。
+    have = {s for s in pattern if re.fullmatch(r"model_\d+", s)}
+    missing, i = [], 0
+    while f"model_{i}" in segments:
+        if f"model_{i}" not in have:
+            missing.append(f"model_{i}")
+        i += 1
+    if missing:
+        insert_at = len(pattern)
+        for j, slot in enumerate(pattern):
+            if slot in ("feature", "material", "padding"):
+                insert_at = j
+                break
+        extra = []
+        for name in missing:
+            extra += ["keywords", name]
+        pattern[insert_at:insert_at] = extra
+
     # 2) 条件特征词自动补位
     if segments.get("feature") and "feature" not in pattern:
         pat2, inserted = [], False
@@ -657,34 +894,52 @@ def assemble_exact(segments, keywords, padding_pool, target,
     total_text_w = sum(W(v) for k, v in layout if k == "text")
 
     def _build(trial_words):
-        """按模板铺开；关键词从 trial_words 里按槽位顺序依次取"""
+        """
+        按模板铺开；关键词按槽位顺序从词池里取。
+
+        ★ 被跳过的词会**留到下一个槽位再试**，而不是直接丢弃。
+          原因：商品名称不能有分隔符，所以「英文粘连」要靠 `can_join()` 拦截
+          （机型段结尾是数字，后面直接跟 `ins风` 会粘成 `18ins风`）。
+          但**奇数长度的词基本都以英文开头**（`ins风` `Q版` `3D立体`），
+          一旦排在机型段后面就被拦掉；若直接丢弃，就永远凑不出奇数缺口，
+          最后只能塞空格 —— 而用户明确要求名称里不能有空格。
+        """
         t = ""
         text_done = 0
-        picked, qi = [], 0
+        picked = []
+        queue = [w for w in trial_words if w]
         for kind, val in layout:
             if kind == "text":
                 t = join_text(t, val)
                 text_done += W(val)
-            elif kind == "kw":
-                remaining_text = total_text_w - text_done
-                while qi < len(trial_words):
-                    kw = trial_words[qi]
-                    qi += 1
-                    if not kw or kw in picked:
-                        continue
-                    if not can_join(t, kw):
-                        continue
-                    cand = join_text(t, kw)
-                    if W(cand) + remaining_text <= target:
-                        t = cand
-                        picked.append(kw)
-                        break
+                continue
+            if kind != "kw":
+                continue
+            remaining_text = total_text_w - text_done
+            rest, chosen = [], None
+            for i, kw in enumerate(queue):
+                if kw in picked:
+                    continue
+                if not can_join(t, kw):
+                    rest.append(kw)          # 本槽位放不下 → 下个槽位再试
+                    continue
+                cand = join_text(t, kw)
+                if W(cand) + remaining_text <= target:
+                    chosen = kw
+                    rest += queue[i + 1:]
+                    break
+                rest.append(kw)
+            if chosen:
+                t = join_text(t, chosen)
+                picked.append(chosen)
+            queue = rest
         return t, picked
 
-    def _fill(trial_words):
-        """给定采用的关键词，重建标题并尝试补满缺口"""
-        t, picked = _build(trial_words)
-        gap = target - W(t)
+    def _pad(t, picked, gap):
+        """
+        给定已铺好的标题 t 与已用词 picked，把长度补到 target。
+        返回 (标题, 是否精确, 用词列表)。
+        """
         if gap < 0:
             out = trim_to_weight(t, target, count_mode)
             return out, W(out) == target, picked
@@ -741,10 +996,82 @@ def assemble_exact(segments, keywords, padding_pool, target,
                     return join_text(t2, piece), True, picked + tail
         return t2, W(t2) == target, picked + tail
 
+    def _fill(trial_words):
+        """
+        给定关键词池，铺开标题并补满长度。
+
+        ★ 奇偶修复（用户要求：名称中绝不能有空格）
+          汉字算 2、英文算 1，总长度存在**奇偶约束**。
+          当缺口是奇数（尤其只差 1 个字符）时，补足词池里可能没有任何词能填
+          （最短的词也有 3~4 字符）。这时**不塞空格**，而是
+          **放弃一个已用关键词后重建** —— 总长度奇偶随之翻转，再用补足词凑满。
+        """
+        t, picked = _build(trial_words)
+        gap = target - W(t)
+        best = _pad(t, picked, gap)
+        if best[1]:
+            return best
+
+        # ★ 奇偶修复 A：缺口是奇数 → 「已用词总长」必须是奇数才凑得满。
+        #   若贪心取到的词恰好全是偶数长度，就把**奇数长度的词提到词池最前面**，
+        #   让贪心一定取到它（它们通常排在末尾，正常取不到）。
+        if gap % 2 == 1 and trial_words:
+            odd_first = sorted(trial_words, key=lambda w: W(w) % 2 == 0)
+            t3, p3 = _build(odd_first)
+            r = _pad(t3, p3, target - W(t3))
+            if r[1]:
+                return r
+            if W(r[0]) > W(best[0]):
+                best = r
+
+        # ★ 奇偶修复 B：逐个放弃一个已用词，重建后重试（从后往前，尽量保留靠前的词）
+        for i in range(len(picked) - 1, -1, -1):
+            sub = picked[:i] + picked[i + 1:]
+            if not sub:
+                continue
+            t2, picked2 = _build(sub)
+            r = _pad(t2, picked2, target - W(t2))
+            if r[1]:
+                return r
+            if W(r[0]) > W(best[0]):
+                best = r
+        return best
+
+    # ★ 候选尝试序列
+    #   目标长度是精确值，而汉字算 2、英文算 1 —— 总长度存在**奇偶约束**：
+    #   只靠「补足词子集和」凑不出奇数缺口（例如差 1 个字符时，没有任何词 ≤1）。
+    #   对策：改变**实际采用的词组合**来翻转奇偶，而不是在末尾塞一个空格。
+    #   （用户明确要求：名称中绝不能有空格，必须用中文或英文填满）
+    _, picked0 = _build(kws)
+
+    trials = [list(kws)]
+    # a) 逐步去掉末尾关键词
+    for drop in range(1, min(len(kws), 6) + 1):
+        trials.append(kws[: len(kws) - drop])
+    # b) 逐个移除「实际被用上的词」—— 后续槽位会取到别的词，总长度随之变化
+    for w in reversed(picked0):
+        trials.append([x for x in kws if x != w])
+    # c) 用「未用词」替换「已用词」，且两者长度奇偶不同 —— 直接翻转总长度奇偶
+    unused = [w for w in kws if w and w not in picked0]
+    swaps = 0
+    for w_out in reversed(picked0):
+        if swaps >= 40:
+            break
+        for w_in in unused:
+            if swaps >= 40:
+                break
+            if (W(w_in) - W(w_out)) % 2 == 0:
+                continue
+            tw = list(kws)
+            try:
+                tw[tw.index(w_out)] = w_in
+            except ValueError:
+                continue
+            trials.append(tw)
+            swaps += 1
+
     best_result = None
-    # 依次尝试：先用全部关键词 → 逐步去掉末尾关键词（调整长度奇偶性）
-    for drop in range(0, min(len(kws), 6) + 1):
-        trial = kws[: len(kws) - drop] if drop else kws
+    for trial in trials:
         title, exact, final_used = _fill(trial)
         if exact:
             return title, True, final_used
@@ -822,17 +1149,33 @@ def validate_title(title, model_name, rules, required_cfg, forbidden_cfg, models
                 issues.append(f"含违禁词「{w}」")
 
     if vcfg.get("check_model_once", True):
-        ms = list(models) if models else split_models(model_name)
-        # 每个机型都要出现（第 1 个带「苹果」、第 2 个带「iPhone」、其余裸写，
-        # 所以统一剥掉 iPhone 前缀再比对）
+        ms = list(models) if models else split_models(model_name, required_cfg)
+        # 每个机型都要出现（第 1 个带品牌、其余裸写，所以统一剥掉品牌前缀再比对）
         for m in ms:
-            suf = re.sub(r"^iPhone", "", m)
+            suf = strip_brand_prefix(m, required_cfg)
             if suf and suf not in title:
                 issues.append(f"机型「{m}」未出现")
-        # 「苹果」「iPhone」各只能出现一次
-        for brand in ["iPhone", "苹果"]:
-            c = title.count(brand)
-            if c > 1:
-                issues.append(f"「{brand}」出现 {c} 次（要求仅 1 次）")
+
+        # 品牌词：本品牌的必须出现（require_brand_words），且各只能出现 1 次
+        actual_brand = detect_brand(ms or model_name, required_cfg)
+        brands = _get_brands(required_cfg)
+        bcfg = brands.get(actual_brand) or {}
+        require_bw = bcfg.get("require_brand_words", True)
+        for w in (bcfg.get("brand_words") or []):
+            c = title.count(w)
+            if require_bw and c == 0:
+                issues.append(f"缺少品牌词「{w}」（{actual_brand}商品必须出现）")
+            elif c > 1:
+                issues.append(f"「{w}」出现 {c} 次（要求仅 1 次）")
+
+        # ★ 不能出现其它品牌的品牌词（华为商品里冒出「苹果」「iPhone」＝虚假品牌宣称）
+        for other, ocfg in brands.items():
+            if other == actual_brand:
+                continue
+            for w in (ocfg.get("brand_words") or []):
+                if w and w in title:
+                    issues.append(
+                        f"出现非本商品品牌词「{w}」（实际品牌：{actual_brand}）"
+                    )
 
     return issues

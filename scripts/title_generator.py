@@ -23,15 +23,18 @@ from ollama_client import chat_with_image
 from title_builder import (
     all_forbidden_words,
     assemble_exact,
+    brand_words_of,
     build_segments,
     collect_bank_words,
     count_length,
+    detect_brand,
     detect_features,
     extract_attrs,
     format_model_group,
     normalize_model,
     pick_material,
     split_models,
+    strip_brand_prefix,
     strip_model_keywords,
     validate_title,
 )
@@ -195,15 +198,32 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
     # ---------- 1. 从商品资料里取硬参数（材质 / 系列）----------
     attrs = extract_attrs(row_data, materials)
 
+    # 材质：优先用商品资料里的，取不到才让模型看图判断
+    material = attrs.get("material") or ""
+
     # ---------- 2. 机型：优先用机型列，取不到才从商品资料里解析 ----------
     src = (models_text or "").strip()
     if not src:
         src = attrs.get("model") or ""
-    models = split_models(src)
-    model_name = format_model_group(models)
+    models = split_models(src, required_cfg)
+    model_name = format_model_group(models, required_cfg)
 
-    # 材质：优先用商品资料里的，取不到才让模型看图判断
-    material = attrs.get("material") or ""
+    # ★ 解析不出机型就明确报错并跳过该行——**绝不编造机型 / 品牌**。
+    #   旧实现在这里回落到写死的「适用于苹果iPhone」，
+    #   于是华为商品的标题里冒出了苹果字样（虚假品牌宣称，会导致退货）。
+    if not models:
+        return {
+            "title": "",
+            "issues": [f"机型列解析不出机型，已跳过（原始内容：{src or '（空）'}）"],
+            "elapsed": 0.0,
+            "tokens": 0,
+            "attempts": 0,
+            "used": [],
+            "attrs": {**attrs, "model": "", "models": [], "material": material},
+            "segments": {},
+            "feature_words": [],
+            "skipped": True,
+        }
 
     total_elapsed, total_tokens = 0.0, 0
     last_title, last_issues, last_used = "", [], []
@@ -246,8 +266,10 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
         reserved = list(required_cfg.get("must_include", []) or [])
         if material:
             reserved.append(material)
+        # 品牌词由固定段承载，关键词里不许再出现（否则品牌词会重复）
+        reserved += brand_words_of(detect_brand(models, required_cfg), required_cfg)
         reserved += models
-        reserved += [re.sub(r"^iPhone", "", m) for m in models]
+        reserved += [strip_brand_prefix(m, required_cfg) for m in models]
 
         # ★ 关键词池 = 模型看图特征词 + 四类运营词库（主推词→搜索词→卖点词→精准词）
         #   差异化：本批次已被其他商品用过的词库词，排到后面（优先用没用过的）

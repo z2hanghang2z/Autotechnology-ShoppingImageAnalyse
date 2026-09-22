@@ -83,13 +83,15 @@ structure:
        keywords_a, model_n, protect_word, keywords_b, model_n, keywords_a,
        feature, material, padding]
 
-    # 5 经典式（机型少时退化用）
+    # 5 核心词靠前 · 机型穿插
     - [model_0, keywords_a, core_word, model_1, new_word, keywords_b,
-       protect_word, model_n, keywords, feature, material, padding]
+       protect_word, model_n, keywords_a, model_n, keywords_b, model_n,
+       keywords_a, model_n, feature, material, padding]
 
   # 兜底模板（配置有误或未启用轮换时使用）
   default_pattern: [model_0, keywords_a, core_word, model_1, keywords_b, new_word,
-                    protect_word, keywords, feature, material, padding]
+                    protect_word, model_n, keywords_a, model_n, keywords_b,
+                    model_n, keywords_a, model_n, feature, material, padding]
 
   # 是否启用模板轮换
   rotate_patterns: true

@@ -4,10 +4,14 @@
 
 # ---------- 硬性必填词 ----------
 # 每个词都必须在标题中至少出现一次
+#
+# ⚠️ 品牌词（苹果 / iPhone / 华为…）**不写在这里**！
+#    本类目已不只卖苹果壳，机型列里会出现华为等其它品牌。
+#    若把「苹果」「iPhone」定为无条件必填词，华为商品会被强行塞进苹果字样
+#    → 虚假品牌宣称 → 买家退货。
+#    品牌词由下方 brands 表按**实际品牌**自动写入标题（见 brands.brand_words）。
 must_include:
   - 手机壳      # 核心类目词
-  - 苹果        # 品牌词（要求1）
-  - iPhone      # 品牌词（要求1）
   - 新款        # 要求3
   - 防摔        # 要求3
 
@@ -33,18 +37,69 @@ material_group:
   - TPU
   - PC
 
-# ---------- 机型段模板 ----------
-# {model} 会被替换为规范化后的机型
+# ---------- 品牌表（按品牌自动切换机型段写法）----------
 #
-# 多机型时的分工（对齐真实生产标题的写法）：
-#   第 1 个机型 → model_template        带「苹果」→ 满足「苹果」必填词
-#   第 2 个机型 → model_template_iphone 带「iPhone」→ 满足「iPhone」必填词
-#   第 3 个起   → 裸机型，不带前缀（穿插在属性词之间）
+# 背景：本类目不只卖苹果壳，机型列会出现华为等其它品牌。
+#       品牌必须按**实际机型**判定，绝不能所有商品都写「苹果」。
 #
-# 例：D 列写 iphone18/17/16/15/14
+# 判定方式：在机型列文本里找 aliases，命中即认定为该品牌；
+#           都没命中则用 default_brand（苹果，兼容历史数据的裸机型写法如 18U）。
+#
+# 模板的分工（对齐真实生产标题的写法）：
+#   title_template_single  只有 1 个机型时用（要一次带齐品牌词）
+#   title_template         多个机型时，第 1 个机型用
+#   title_template_2       多个机型时，第 2 个机型用
+#   title_template_n       第 3 个起用（裸机型，穿插在属性词之间）
+#
+# 例（苹果，机型列写 iphone18/17/16/15/14）：
 #   → 适用于苹果18 … iPhone17 … 16 … 15 … 14
-model_template: "适用于苹果{model}"
-model_template_iphone: "iPhone{model}"
+# 例（苹果，机型列只写 iphoneDuo）：
+#   → 适用于苹果iPhoneDuo（单机型要同时出现「苹果」「iPhone」）
+# 例（华为，机型列写 华为puraXMax/华为puraXMax典藏版）：
+#   → 适用华为PuraXMax … PuraXMax典藏版
+brands:
+  苹果:
+    aliases: [苹果, iPhone, iphone, IPHONE, Iphone]
+    # 单机型：一次把「苹果」「iPhone」都带上
+    title_template_single: "适用于苹果iPhone{model}"
+    title_template: "适用于苹果{model}"
+    title_template_2: "iPhone{model}"
+    title_template_n: "{model}"
+    # 标题里承载该品牌的词
+    brand_words: [苹果, iPhone]
+    # 是否要求这些品牌词**必须出现**（苹果商品要求「苹果」「iPhone」都出现）
+    require_brand_words: true
+
+  华为:
+    aliases: [华为, huawei, HUAWEI, Huawei, HW, hw]
+    title_template_single: "适用华为{model}"
+    title_template: "适用华为{model}"
+    title_template_2: "{model}"
+    title_template_n: "{model}"
+    brand_words: [华为]
+    require_brand_words: true
+
+# 机型列里没写品牌时，默认按哪个品牌处理
+default_brand: 苹果
+
+# ---------- 机型后缀别名 ----------
+# 把机型列里的简写展开成标准写法。
+# 例：18pm → iPhone18ProMax、17p → iPhone17Pro
+model_suffix_aliases:
+  pm: ProMax
+  p: Pro
+  promax: ProMax
+  pro: Pro
+  plus: Plus
+  mini: Mini
+  max: Max
+  air: Air
+  ultra: Ultra
+  duo: Duo
+  se: SE
+  u: U
+  e: E
+
 # 机型来源列（表格中的列字母），可在运行时用 --model-col 覆盖
 model_column: "D"
 
@@ -179,6 +234,25 @@ word_banks:
 #   detect_in_keywords —— 在视觉模型看图输出的关键词里找
 # 维护说明：想新增一个特征（如「挂绳」「旋转」），照下面格式加一条即可。
 conditional_words:
+  # ★ 迪士尼联名：A 列出现 IP 联名 / 迪士尼 字样时，标题必须带「迪士尼联名」
+  #
+  # 触发依据（实测 A 列路径形态）：
+  #   Z:\1-产品图片\2-折叠\M1-云彩系列-中轴\02-IP联名\260729-缎带七宝+庄（迪士尼）+.Y\主图-梓涵
+  #                                        ↑ 分类目录名        ↑ 具体联名款
+  #
+  # ⚠️ 注意：「IP联名」是路径里的**分类目录名**（02-IP联名）。
+  #     当前该目录下全部是迪士尼联名，所以拿它当触发条件。
+  #     若以后这个目录里出现**非迪士尼**的 IP（如三丽鸥、宝可梦、名侦探柯南），
+  #     必须把「IP联名 / ip联名 / Ip联名」从 detect_in_data 里删掉、只保留「迪士尼」，
+  #     否则会给非迪士尼商品扣上迪士尼的帽子 → 虚假品牌宣称 → 投诉/退货。
+  #
+  # 另：detect_in_keywords 故意留空 —— 图片里有卡通图案就判迪士尼风险太高，
+  #     宁可漏加（少个卖点），不可错加（法律风险）。要启用请只填**明确**的迪士尼角色名。
+  - feature: 迪士尼联名
+    must_include: 迪士尼联名
+    detect_in_data: [迪士尼, Disney, disney, DISNEY, IP联名, ip联名, Ip联名]
+    detect_in_keywords: []
+
   # 磁吸：商品是磁吸的就带上「磁吸magsafe」
   - feature: 磁吸
     must_include: 磁吸magsafe
@@ -199,9 +273,17 @@ conditional_words:
     detect_in_keywords: [挂绳, 挂链, 吊绳, 手绳]
 
 # ---------- 奇偶补齐兜底 ----------
-# 当缺口只剩 1 个字符、且词池里找不到长度为 1 的词时使用。
-# 默认用空格（不可见、不影响阅读）。如需改成别的字符，改这里即可。
-parity_filler: " "
+# 用户要求（2026-09-22）：**商品名称中绝不能有空格**，必须用中文或英文填满。
+# 所以这里默认为空字符串 —— 不再往末尾塞空格。
+#
+# 那奇数缺口怎么补？由 `assemble_exact` 的**换词机制**解决：
+#   汉字算 2、英文算 1，总长度存在奇偶约束。凑不出时不是塞空格，
+#   而是换掉一个已用词（长度奇偶不同）来翻转总长度奇偶，再用补足词凑满。
+#   见 `assemble_exact` 里的 trials（a/b/c 三类候选）。
+#
+# 只有在极少数情况下仍凑不满时，才会放弃并在校验里报「无法精确凑满目标长度」，
+# 由重试机制换一批关键词再试 —— 宁可报错，也不往名称里塞空格。
+parity_filler: ""
 
 # ---------- 英文片段白名单 ----------
 # 用途：过滤模型自创的无意义英文串（实测模型会编出 timeLUCKYEH 这类假品牌名）。

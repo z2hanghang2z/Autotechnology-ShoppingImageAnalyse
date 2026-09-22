@@ -261,6 +261,7 @@ def main():
     print("=" * 74)
 
     updates, results = {}, []
+    skipped_rows = []          # 机型解析失败、被跳过的行
     used_padding = set()
     avoid_repeat = bool(diff_cfg.get("avoid_repeat_padding", True))
     do_rotate = bool(diff_cfg.get("rotate_keywords", True))
@@ -300,6 +301,17 @@ def main():
 
         ref = f"{ncol}{row}"
         title = res["title"]
+
+        # ★ 机型解析失败的行：不写 C 列，只报错。
+        #   绝不用「适用于苹果iPhone」这类编造的机型占位。
+        if not title:
+            print(f"    → {ref} ⛔ 未生成（C 列不写入）")
+            if res["issues"]:
+                print(f"      ⚠ {'；'.join(res['issues'])}")
+            results.append((row, ref, "", res["issues"]))
+            skipped_rows.append((row, ref, res["issues"]))
+            continue
+
         print(f"    → {ref} [{count_length(title, mode)}字符/{len(title)}字] "
               f"{res['elapsed']}s")
         print(f"      {title}")
@@ -335,6 +347,15 @@ def main():
               f"平均 {round(sum(s for _, _, s in pairs) / len(pairs), 3)}")
         print("-" * 74)
 
+    # ---------- 4.5 跳过行汇总 ----------
+    if skipped_rows:
+        print("\n" + "-" * 74)
+        print(f"【已跳过 {len(skipped_rows)} 行：机型解析失败，C 列未写入】")
+        for row, ref, iss in skipped_rows:
+            print(f"  第 {row} 行（{ref}）：{'；'.join(iss)}")
+        print("  → 请在该行机型列补充完整机型后重跑，不要留空。")
+        print("-" * 74)
+
     # ---------- 5. 安全写回 ----------
     print("\n" + "=" * 74)
     if args.dry_run:
@@ -347,6 +368,8 @@ def main():
 
     ok = sum(1 for r in results if not r[3])
     print(f"\n完成 {ok}/{len(results)} 全部校验通过 | 总耗时 {total}s")
+    if skipped_rows:
+        print(f"⚠ 有 {len(skipped_rows)} 行因机型解析失败被跳过，C 列未写入")
     print("=" * 74)
     return 0 if ok == len(results) else 1
 
