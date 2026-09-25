@@ -30,9 +30,12 @@ from title_builder import (
     detect_brand,
     detect_features,
     extract_attrs,
+    extract_core_elements,
+    extract_material,
     format_model_group,
     normalize_model,
     pick_material,
+    required_extra_keywords,
     split_models,
     strip_brand_prefix,
     strip_model_keywords,
@@ -64,14 +67,19 @@ PROMPT_TEMPLATE = """请仔细观察这张手机壳图片，输出 JSON 格式�
 3. 覆盖这些维度：工艺、功能、风格、适用人群、使用场景
 4. 必须包含图中真实可见的特征（颜色、图案元素）
 5. 【严禁】包含任何机型信息（iPhone、苹果、三星、华为、小米、折叠屏等），机型由商品资料提供
-6. 可以包含通用风格词（如 ins风、Q版、3D立体），但【严禁】自创任何英文品牌名、
-   英文单词串或看起来像品牌名的字母组合（例如 timeLUCKYEH 这类无意义字母串）
-7. 【严禁】堆砌同前缀词。例如不要同时给出"撞色款""撞色设计""撞色风格"，
+6. 【★★ 严禁编造功能特征】只写**图片里能明确看到**的功能结构。
+   尤其是「支架」「支点」「旋转支架」「挂绳」「挂链」「吊绳」「手绳」「磁吸」「无线充」
+   这类**产品属性宣称**——图片里没有明确对应的结构（立式支架、挂绳孔/挂链、磁吸环）就
+   一个字都不能写。写错属于**虚假宣传**，会导致投诉和退货。
+   这些特征由商品资料统一判定，**不需要你判断**。
+7. 可以包含通用风格词（如 ins风、Q版、3D立体），但【严禁】自创任何英文品牌名、
+   英文单词串或看起来像品牌名的字母组合（例如 timeTastyBalancingAct 这类无意义字母串）
+8. 【严禁】堆砌同前缀词。例如不要同时给出"撞色款""撞色设计""撞色风格"，
    也不要给出只换尾字的词，只保留最有代表性的一个
-8. 【严禁】包含违禁词：最、第一、顶级、唯一、100%、万能、永久、官方、正品、授权、正版
-9. 【严禁】包含图片上的水印文字（如 wf、wj）
-10. 【严禁】包含其他类目词（钢化膜、充电器、数据线、耳机）
-11. 关键词之间语义不要重复，每个词都应是独立的信息点
+9. 【严禁】包含违禁词：最、第一、顶级、唯一、100%、万能、永久、官方、正品、授权、正版
+10. 【严禁】包含图片上的水印文字（如 wf、wj）
+11. 【严禁】包含其他类目词（钢化膜、充电器、数据线、耳机）
+12. 关键词之间语义不要重复，每个词都应是独立的信息点
 
 说明：material 字段仅在商品资料未提供材质时才会被采用，请如实判断，不要编造。
 
@@ -198,8 +206,12 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
     # ---------- 1. 从商品资料里取硬参数（材质 / 系列）----------
     attrs = extract_attrs(row_data, materials)
 
-    # 材质：优先用商品资料里的，取不到才让模型看图判断
-    material = attrs.get("material") or ""
+    # 材质优先级：A 列（商品资料）→ D 列（机型列，常写成「透明、iPhone18Pro/…」）
+    # → 都取不到才让模型看图判断。
+    # ★ 2026-09-22：补上 D 列这一环 —— 实测用户把材质写在 D 列时，
+    #   A 列没有材质 → 程序去问模型 → 模型看图误判成「软壳」，
+    #   而 D 列明明写着「透明」。
+    material = attrs.get("material") or extract_material(models_text, required_cfg)
 
     # ---------- 2. 机型：优先用机型列，取不到才从商品资料里解析 ----------
     src = (models_text or "").strip()
@@ -227,7 +239,7 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
 
     total_elapsed, total_tokens = 0.0, 0
     last_title, last_issues, last_used = "", [], []
-    last_segments, last_features = {}, []
+    last_segments, last_features, last_core_els = {}, [], []
     feedback = ""
 
     for attempt in range(1, max_attempts + 1):
@@ -255,11 +267,12 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
             material = pick_material(data.get("material", ""),
                                      " ".join(raw_keywords), required_cfg)
 
-        # ★ 条件特征词：商品是磁吸的就必须带「磁吸magsafe」，是支架的就必须带「支架」
-        feature_words = detect_features(row_data, raw_keywords, required_cfg)
+        # ★ 条件特征词：商品是磁吸的就必须带「磁吸magsafe」，是支架的就必须带支架类词
+        #   （支架类词从 4 个候选里按行轮换取一个，增加名称多样性）
+        feature_words = detect_features(row_data, raw_keywords, required_cfg, rotate=rotate)
 
         segments = build_segments(model_name, material, required_cfg,
-                                  feature_words, models=models)
+                                  feature_words, models=models, rotate=rotate)
         prefix_text = "".join(segments.values())
 
         # 固定段已占用的词，关键词里不得再出现（避免重复表达）
@@ -271,9 +284,26 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
         reserved += models
         reserved += [strip_brand_prefix(m, required_cfg) for m in models]
 
-        # ★ 关键词池 = 模型看图特征词 + 四类运营词库（主推词→搜索词→卖点词→精准词）
+        # ★ 机型附加词（如 iPhoneDuo → 标题里还要各出现一次 duo / DUO）
+        #   它们是**必须出现**的词，通过 priority_keywords 传给组装函数：
+        #   **不参与 rotate 轮换、固定优先取用** —— 否则会被轮换挤到队尾取不到。
+        #   若紧邻机型段会被防粘连拦掉，机制会自动留到下一个槽位再试。
+        extra_kws = required_extra_keywords(models, required_cfg)
+
+        # ★ 核心元素（设计 / 图案）：模型识别的图案主题词（城堡/大象/彩虹…）
+        #   配额只保留模型词最前面几个，设计元素排在后面会被截掉 →
+        #   这里把它们放到**最优先位置**（不参与轮换），保证一定被取到。
+        #   ⚠️ 踩坑：曾把它们前置到模型词列表里，结果被 `rotate` 轮换转到队尾，
+        #      只有 rotate=0 的那一行生效 —— 必须走 priority_keywords 才稳。
+        core_els = extract_core_elements(data.get("observed"), required_cfg, fwords)
+        ce_cfg = required_cfg.get("core_elements") or {}
+        n_max = int(ce_cfg.get("max_per_title", 3) or 0)
+        core_priority = core_els[:n_max] if n_max > 0 else []
+
+        # ★ 关键词池 = 模型看图特征词 + 运营词库（搜索词→卖点词→精准词）
         #   差异化：本批次已被其他商品用过的词库词，排到后面（优先用没用过的）
-        bank_words = collect_bank_words(required_cfg)
+        #   rotate 用于「每类词限量」时按行轮换取词（如精准词每标题只放 1 个）
+        bank_words = collect_bank_words(required_cfg, rotate=rotate)
         if exclude_padding:
             fresh = [w for w in bank_words if w not in exclude_padding]
             reused = [w for w in bank_words if w in exclude_padding]
@@ -311,10 +341,23 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
         else:
             pattern = stcfg.get("default_pattern")
 
+        # ★ 被「每类限量」约束的词，必须从补足词池里剔除。
+        #   否则它们会**绕过限量**：例如精准词限 1 个，
+        #   但 padding_pool 里也有「男女款/情侣款」，补长度时又塞进来一个。
+        quota_keys = (required_cfg.get("word_banks") or {}).get("max_per_title") or {}
+        restricted = set()
+        for _k in quota_keys:
+            for _w in ((required_cfg.get("word_banks") or {}).get(_k) or []):
+                restricted.add(str(_w).strip())
+        pad_pool = [w for w in padding_pool if w not in restricted]
+
         title, exact, used = assemble_exact(
-            segments, kws, padding_pool, target,
+            segments, kws, pad_pool, target,
             count_mode=count_mode, exclude_words=exclude_padding,
             rotate=rotate, pattern=pattern,
+            # 顺序：机型附加词(duo/DUO) 在前 —— 它们会被防粘连拦住、
+            # 要等到下一个槽位才落位，放前面才有足够槽位余量；核心元素是中文，好落位。
+            priority_keywords=extra_kws + core_priority,
         )
 
         # 奇偶兜底：仍差 1 个字符时补一个不可见字符
@@ -331,6 +374,7 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
 
         last_title, last_issues, last_used = title, issues, used
         last_segments, last_features = segments, feature_words
+        last_core_els = core_priority
         if not issues:
             break
         feedback = "；".join(issues)
@@ -345,4 +389,5 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
         "attrs": {**attrs, "model": model_name, "models": models, "material": material},
         "segments": last_segments,
         "feature_words": last_features,
+        "core_elements": last_core_els,
     }

@@ -72,9 +72,21 @@ def check_word_conflicts(required_cfg, forbidden_cfg):
     required_words = []
     required_words += [str(x) for x in (required_cfg.get("must_include") or [])]
     required_words += [str(x) for x in (required_cfg.get("material_group") or [])]
+    # 二选一必填词（组内每个候选都可能被用到，都要检查）
+    for grp in (required_cfg.get("must_include_any") or []):
+        if isinstance(grp, (list, tuple)):
+            required_words += [str(x) for x in grp]
     for rule in (required_cfg.get("conditional_words") or []):
-        if isinstance(rule, dict) and rule.get("must_include"):
+        if not isinstance(rule, dict):
+            continue
+        if rule.get("must_include"):
             required_words.append(str(rule["must_include"]))
+        for x in (rule.get("must_include_any") or []):
+            required_words.append(str(x))
+    # 机型附加词（如 Duo → duo / DUO）
+    for rule in (required_cfg.get("model_extra_words") or []):
+        if isinstance(rule, dict):
+            required_words += [str(x) for x in (rule.get("add") or [])]
     banks = required_cfg.get("word_banks") or {}
     for v in banks.values():
         if isinstance(v, list):
@@ -116,6 +128,25 @@ def trim_to_weight(text, max_weight, count_mode="char"):
 
 
 # ---------------------------------------------------------------- 机型处理
+
+def extract_material(text, required_cfg=None, material_group=None):
+    """
+    从任意文本里按「最长命中」匹配材质库，取不到返回空串。
+
+    用途：A 列（商品资料）和 D 列（机型列常写成「透明、iPhone18Pro/…」）都可能带材质，
+          两列都要试，都能取不到时才让模型看图判断。
+    """
+    mats = material_group
+    if mats is None:
+        mats = (required_cfg or {}).get("material_group") or []
+    raw = str(text or "")
+    if not raw:
+        return ""
+    for m in sorted([m for m in mats if m], key=len, reverse=True):
+        if m in raw:
+            return m
+    return ""
+
 
 def extract_attrs(row_data, material_group=None):
     """
@@ -561,26 +592,57 @@ def pick_material(model_material, keyword_text, required_cfg):
     return ""
 
 
-def collect_bank_words(required_cfg):
+def collect_bank_words(required_cfg, rotate=0, apply_quota=True):
     """
-    按优先级收集四类运营词库的词：
-        主推词 → 搜索词 → 卖点词 → 精准词
+    按优先级收集运营词库的词：搜索词 → 卖点词 → 精准词
     返回去重后的有序列表。顺序决定组装时的取用优先级。
+
+    `word_banks.max_per_title` 可限定每类词**在单条标题里最多用几个**：
+        例：`precise_words: 1` —— 精准词只放 1 个进池子，
+            避免长尾词堆多了挤占搜索词/卖点词的位置。
+    被限量的类别会**按行轮换**取词，保证跨商品不总是同一个。
+
+    apply_quota=False —— 用于「统计全量词库」的场景（如 run.py 的差异化跟踪），
+        此时不裁剪，返回全部词。
+
+    注：main_words（主推词）已于 2026-09-22 弃用，不再参与组装。
     """
     banks = required_cfg.get("word_banks") or {}
     order = banks.get("priority") or [
-        "main_words", "search_words", "selling_words", "precise_words"
+        "search_words", "selling_words", "precise_words"
     ]
+    quota = banks.get("max_per_title") or {}
     out = []
     for key in order:
-        for w in (banks.get(key) or []):
-            w = str(w).strip()
-            if w and w not in out:
-                out.append(w)
+        words = [str(w).strip() for w in (banks.get(key) or []) if str(w or "").strip()]
+        words = [w for w in words if w not in out]
+        n = quota.get(key) if apply_quota else None
+        if isinstance(n, int) and not isinstance(n, bool):
+            if n <= 0:
+                continue
+            if rotate and words:                      # 按行轮换取哪几个
+                r = rotate % len(words)
+                words = words[r:] + words[:r]
+            words = words[:n]
+        out += words
     return out
 
 
-def detect_features(row_data, model_keywords, required_cfg):
+def pick_rotating(options, rotate=0):
+    """
+    从候选里**按行轮换**取一个（第 1 行第 1 个、第 2 行第 2 个…循环）。
+
+    用途：同一批商品的同类词不要千篇一律（如每条都用「新款」），
+          换着用能增加名称多样性。用轮换而不是真随机，是为了**可复现** ——
+          同一批数据跑两次结果一致，便于对比与排查。
+    """
+    opts = [str(o).strip() for o in (options or []) if str(o or "").strip()]
+    if not opts:
+        return ""
+    return opts[rotate % len(opts)]
+
+
+def detect_features(row_data, model_keywords, required_cfg, rotate=0):
     """
     判定商品具备哪些特征，返回**必须包含**的特征词列表。
 
@@ -588,7 +650,11 @@ def detect_features(row_data, model_keywords, required_cfg):
         detect_in_data     —— 商品资料（表格第一列）文本
         detect_in_keywords —— 视觉模型看图输出的关键词
 
-    例：资料里含「支点」→ 判定为支架 → 返回 ['支架']
+    命中后取词：
+        must_include        —— 固定用这个词
+        must_include_any    —— 从候选里**按行轮换**取一个（增加多样性）
+
+    例：资料里含「支点」→ 判定为支架 → 从 [支架, 支点, 旋转支架, 360旋转支架] 轮换取一个
         模型关键词里含「磁吸」→ 判定为磁吸 → 返回 ['磁吸magsafe']
     """
     rules = required_cfg.get("conditional_words") or []
@@ -608,14 +674,87 @@ def detect_features(row_data, model_keywords, required_cfg):
                 if w and w in kw_text:
                     hit = True
                     break
-        if hit:
-            word = str(rule.get("must_include") or "").strip()
-            if word and word not in out:
-                out.append(word)
+        if not hit:
+            continue
+        word = str(rule.get("must_include") or "").strip()
+        if not word:
+            word = pick_rotating(rule.get("must_include_any"), rotate)
+        if word and word not in out:
+            out.append(word)
     return out
 
 
-def build_segments(model_name, material, required_cfg, feature_words=None, models=None):
+def any_group_options(required_cfg):
+    """取全部「二选一必填词」分组（must_include_any），供校验与组装共用"""
+    groups = required_cfg.get("must_include_any") or []
+    return [[str(o).strip() for o in g if str(o or "").strip()]
+            for g in groups if isinstance(g, (list, tuple))]
+
+
+def required_extra_keywords(models, required_cfg):
+    """
+    机型附加词：机型名里出现 `match` 片段时，额外要求出现的词。
+
+    例：机型 iPhoneDuo → 返回 ['duo', 'DUO']（不同大小写都是有效搜索词）
+    这些词由**关键词槽位**承载（穿插在属性词之间），不进固定段。
+    """
+    rules = required_cfg.get("model_extra_words") or []
+    text = " ".join(str(m or "") for m in (models or []))
+    out = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        m = str(rule.get("match") or "")
+        if not m or m not in text:
+            continue
+        for w in (rule.get("add") or []):
+            w = str(w).strip()
+            if w and w not in out:
+                out.append(w)
+    return out
+
+
+def extract_core_elements(observed, required_cfg, forbidden_words=None):
+    """
+    从视觉模型的 `observed.图案` 里提取**核心设计元素**。
+
+    背景：模型词有 ≤15% 的占比配额，只保留它输出的最前面几个词；
+          而设计元素（城堡 / 大象 / 彩虹 / 花朵…）通常排在列表后面 → 每次都被截掉，
+          结果标题里全是「可爱 / 简约 / 高级感」这类通用词，看不出商品长什么样。
+
+    例：observed = {"图案": "城堡、英文字母"}          → ['城堡']
+        observed = {"图案": "大象、彩虹、花朵、蛋糕"} → ['大象', '彩虹', '花朵', '蛋糕']
+    """
+    cfg = required_cfg.get("core_elements") or {}
+    if not cfg.get("enabled", True):
+        return []
+
+    if isinstance(observed, dict):
+        raw = str(observed.get("图案") or "")
+    else:
+        raw = str(observed or "")
+    if not raw:
+        return []
+
+    exclude = {str(x).strip() for x in (cfg.get("exclude") or []) if str(x or "").strip()}
+    fw = [str(w) for w in (forbidden_words or []) if w]
+    out = []
+    for part in re.split(r"[、,，;；/|]+|\s+", raw):
+        w = str(part).strip()
+        if not w or w in exclude or w in out:
+            continue
+        if find_punctuation(w):            # 商品名称禁止标点，含标点的直接跳过
+            continue
+        if not (2 <= len(w) <= 8):         # 太短没意义，太长放不下
+            continue
+        if any(f and f in w for f in fw):  # 命中违禁词直接跳过
+            continue
+        out.append(w)
+    return out
+
+
+def build_segments(model_name, material, required_cfg, feature_words=None,
+                   models=None, rotate=0):
     """
     构造固定段（承载全部必填词），返回 {槽位名: 文本}。
 
@@ -674,7 +813,13 @@ def build_segments(model_name, material, required_cfg, feature_words=None, model
 
     # 必填词拆位（对齐真实标题的分布：手机壳 22%、新款 48%、防摔 74%）
     seg["core_word"] = required_cfg.get("core_word", "手机壳")
-    seg["new_word"] = required_cfg.get("new_word", "新款")
+    # ★ 新款 / 2026新款 二选一：找包含 new_word 的那个「二选一」分组，按行轮换取一个
+    new_w = str(required_cfg.get("new_word", "新款"))
+    for grp in any_group_options(required_cfg):
+        if new_w in grp:
+            new_w = pick_rotating(grp, rotate) or new_w
+            break
+    seg["new_word"] = new_w
     seg["protect_word"] = required_cfg.get("protect_word", "防摔")
     # 组合式 + 旧槽位名，兼容老模板
     seg["core_suffix"] = required_cfg.get("core_template", "新款手机壳防摔")
@@ -868,12 +1013,15 @@ def _resolve_pattern(pattern, segments, keywords):
 
 
 def assemble_exact(segments, keywords, padding_pool, target,
-                   count_mode="char", exclude_words=None, rotate=0, pattern=None):
+                   count_mode="char", exclude_words=None, rotate=0, pattern=None,
+                   priority_keywords=None):
     """
     按模板精确组装到 target 长度（按 count_mode 口径），且绝不切断词语。
 
     ★ 关键词槽位依次消费同一个词池 —— 每个词只会被用一次，不会重复出现。
     ★ 固定段（机型/手机壳/新款/防摔/材质/特征）必须放得下，加关键词时会预留余量。
+    ★ priority_keywords —— **必须出现**的关键词（如机型附加词 duo/DUO）。
+      它们**不参与 rotate 轮换**，固定放在词池最前，否则会被轮换挤到队尾取不到。
 
     返回 (标题, 是否精确命中, 使用的词列表)
     """
@@ -888,6 +1036,13 @@ def assemble_exact(segments, keywords, padding_pool, target,
     if rotate and kws:
         r = rotate % len(kws)
         kws = kws[r:] + kws[:r]
+    # ★ 必含关键词放在轮换**之后**，并且**一律移到最前面**（即使它已在词池里也要挪）。
+    #   若只做「不在池里才前置」，那些本来就在池里的必含词会被 rotate 转到队尾，
+    #   而关键词槽位在前面就填满了 → 永远取不到。
+    pri = [str(w).strip() for w in (priority_keywords or []) if str(w or "").strip()]
+    if pri:
+        kws = [w for w in kws if w not in pri]
+        kws = pri + kws
 
     layout = _resolve_pattern(pattern, segments, kws)
     # 固定段总长度：用来给还没放的关键词预留余量，保证必填词不被截断
@@ -1134,9 +1289,17 @@ def validate_title(title, model_name, rules, required_cfg, forbidden_cfg, models
         for w in required_cfg.get("must_include", []) or []:
             if w not in title:
                 issues.append(f"缺少必填词「{w}」")
+        # 二选一必填词：每组至少命中一个（如 新款 / 2026新款）
+        for grp in any_group_options(required_cfg):
+            if grp and not any(w in title for w in grp):
+                issues.append(f"缺少必填词（需含其一：{'/'.join(grp)}）")
         materials = required_cfg.get("material_group", []) or []
         if materials and not any(m in title for m in materials):
             issues.append(f"缺少材质词（需含其一：{'/'.join(materials[:5])}...）")
+        # 机型附加词（如 iPhoneDuo → 还要各出现一次 duo / DUO）
+        for w in required_extra_keywords(models, required_cfg):
+            if w not in title:
+                issues.append(f"缺少机型附加词「{w}」")
 
     if vcfg.get("check_punctuation", True):
         punct = find_punctuation(title)

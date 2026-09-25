@@ -266,7 +266,8 @@ def main():
     avoid_repeat = bool(diff_cfg.get("avoid_repeat_padding", True))
     do_rotate = bool(diff_cfg.get("rotate_keywords", True))
     # 差异化只跟踪「运营词库」用过的词（模型特征词是商品特有的，不参与去重）
-    bank_set = set(collect_bank_words(required_cfg))
+    # apply_quota=False：这里要**全量**词库，否则被限量的词（如精准词）统计不到
+    bank_set = set(collect_bank_words(required_cfg, apply_quota=False))
     t0 = time.time()
 
     for i, row in enumerate(rows, start=1):
