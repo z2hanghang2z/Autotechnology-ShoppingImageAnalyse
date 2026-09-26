@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from extract_cell_images import extract
 from ollama_client import health_check, load_config
 from title_builder import (
+    auto_detected_brands,
     check_pattern_models_separated,
     check_word_conflicts,
     collect_bank_words,
@@ -320,6 +321,9 @@ def main():
             print(f"      ⚠ {'；'.join(res['issues'])}")
         else:
             print("      ✅ 校验通过")
+        _dropped = res.get("dropped_features") or []
+        if _dropped:
+            print(f"      ℹ 长度不够，已让位丢掉特征词：{'、'.join(_dropped)}")
 
         updates[ref] = title
         results.append((row, ref, title, res["issues"]))
@@ -371,6 +375,11 @@ def main():
     print(f"\n完成 {ok}/{len(results)} 全部校验通过 | 总耗时 {total}s")
     if skipped_rows:
         print(f"⚠ 有 {len(skipped_rows)} 行因机型解析失败被跳过，C 列未写入")
+    _auto = auto_detected_brands()
+    if _auto:
+        print(f"ℹ 自动识别到品牌表里没有的新品牌：{'、'.join(_auto)}")
+        print("  （已用默认模板「适用{品牌}{机型}」处理；"
+              "想自定义请加进 config/required_words.yaml 的 brands）")
     print("=" * 74)
     return 0 if ok == len(results) else 1
 

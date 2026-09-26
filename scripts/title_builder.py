@@ -244,9 +244,16 @@ _DEFAULT_BRAND = "苹果"
 
 
 def _get_brands(required_cfg=None):
-    """取品牌表（配置优先，缺失时用兜底表）"""
+    """取品牌表（配置优先，缺失时用兜底表）+ 运行时自动识别到的新品牌"""
     table = (required_cfg or {}).get("brands")
-    return table if isinstance(table, dict) and table else _FALLBACK_BRANDS
+    base = table if isinstance(table, dict) and table else _FALLBACK_BRANDS
+    auto = globals().get("_AUTO_BRANDS") or {}
+    if not auto:
+        return base
+    merged = dict(base)
+    for k, v in auto.items():
+        merged.setdefault(k, v)
+    return merged
 
 
 def _get_suffix_aliases(required_cfg=None):
@@ -332,6 +339,116 @@ def brand_words_of(brand, required_cfg=None):
     """取某品牌在标题里承载的品牌词（用于重复出现检查 / 关键词去重）"""
     cfg = _get_brands(required_cfg).get(brand) or {}
     return [w for w in (cfg.get("brand_words") or []) if w]
+
+
+# ---------------------------------------------------------------- 未知品牌自动识别
+# 背景（2026-09-26）：品牌表原来只有苹果/华为，遇到「小米18Fold」这种新品牌时
+#   detect_brand 会回落到 default_brand（苹果）→ 机型被套上 iPhone →
+#   **虚假品牌宣称**（小米壳写成「适用于苹果18」）。
+# 处理：识别出未知品牌前缀 → 自动注册进运行时品牌表（用默认模板）→ 正常生成。
+
+_AUTO_BRANDS = {}          # 运行时自动识别的品牌：{品牌名: 配置}
+_AUTO_DETECTED = []        # 本次运行自动识别到的新品牌（用于提示用户）
+
+
+def auto_detected_brands():
+    """本次运行自动识别出的新品牌名列表"""
+    return list(_AUTO_DETECTED)
+
+
+def _is_known_alias(text, required_cfg=None):
+    """text 是否以任何已知品牌别名开头"""
+    low = str(text or "").lower()
+    return any(low.startswith(a.lower()) for a in _brand_aliases(required_cfg) if a)
+
+
+def guess_brand_name(seg, required_cfg=None):
+    """
+    从机型片段里**猜出未知品牌名**（开头的中文串），识别不出返回 None。
+
+        小米18Fold      -> '小米'
+        三星GalaxyS24   -> '三星'
+        18U             -> None（没有品牌前缀，交给 default_brand）
+
+    排除：已知品牌别名、材质词、尾部修饰词、纯数字/英文开头。
+    """
+    s = str(seg or "").strip()
+    if not s:
+        return None
+    m = re.match(r"^([\u4e00-\u9fff]{2,4})", s)
+    if not m:
+        return None
+    name = m.group(1)
+    if _is_known_alias(s, required_cfg):
+        return None
+    # 材质词 / 尾部修饰词不算品牌（「素皮18Fold」这种是材质前缀没剥干净）
+    materials = (required_cfg or {}).get("material_group") or []
+    if any(name == str(x) for x in materials):
+        return None
+    if name in _MODEL_TAIL_WORDS:
+        return None
+    if len(s) <= len(name):        # 光有品牌没有机型，不算
+        return None
+    return name
+
+
+def _register_auto_brand(name):
+    """把自动识别的品牌注册进运行时品牌表（默认模板：适用{品牌}{机型}）"""
+    if not name:
+        return
+    if name not in _AUTO_BRANDS:
+        _AUTO_BRANDS[name] = {
+            "aliases": [name],
+            "title_template_single": "适用" + name + "{model}",
+            "title_template": "适用" + name + "{model}",
+            "title_template_2": "{model}",
+            "title_template_n": "{model}",
+            "brand_words": [name],
+            "require_brand_words": True,
+            "_auto": True,
+        }
+    if name not in _AUTO_DETECTED:
+        _AUTO_DETECTED.append(name)
+
+
+def detect_brand_strict(spec, required_cfg=None):
+    """
+    **严格**识别品牌：没命中任何别名就返回 None（不回落到 default_brand）。
+
+    与 detect_brand 的区别：detect_brand 会把未知文本当苹果，
+    这里返回 None，交给调用方决定（猜新品牌 or 用默认品牌）。
+    """
+    if isinstance(spec, (list, tuple)):
+        s = " ".join(str(x) for x in spec)
+    else:
+        s = str(spec or "")
+    if not s:
+        return None
+    low = s.lower()
+    best_name, best_len = None, -1
+    for name, cfg in _get_brands(required_cfg).items():
+        for a in (cfg.get("aliases") or []):
+            if a and a.lower() in low and len(a) > best_len:
+                best_name, best_len = name, len(a)
+    if best_name:
+        return best_name
+    # 自动识别的品牌
+    for name in _AUTO_BRANDS:
+        if name and name in s:
+            return name
+    return None
+
+
+def brand_of_model(model, required_cfg=None):
+    """单个机型属于哪个品牌（先查别名，再猜未知品牌前缀，最后回落 default_brand）"""
+    b = detect_brand_strict(model, required_cfg)
+    if b:
+        return b
+    name = guess_brand_name(model, required_cfg)
+    if name:
+        _register_auto_brand(name)
+        return name
+    return (required_cfg or {}).get("default_brand") or _DEFAULT_BRAND
 
 
 # 机型列里可能混入材质，用这些分隔符切开（实测写法「素皮、华为puraXMax/…」）
@@ -483,7 +600,7 @@ def split_models(spec, required_cfg=None):
         if not s:
             return []
 
-    # 3. 整段先判一次品牌（一个商品只有一个品牌）
+    # 3. 整段先判一次品牌，作为「没有品牌前缀」机型（如 18U）的兜底
     brand = detect_brand(s, required_cfg)
 
     # 4. 切成候选段；切不动就整段交给 token 正则扫
@@ -491,9 +608,14 @@ def split_models(spec, required_cfg=None):
     if not segs:
         return []
 
+    # 5. ★ 每个片段**单独判品牌**（2026-09-26）
+    #    一个单元格可能混多个品牌的机型，如「iPhoneDuo/小米18Fold/华为PuraXMax」
+    #    —— 折叠屏通用壳常见写法。旧实现整段只判一次品牌，判成苹果后
+    #    华为片段会被剥成「PuraXMax」再走苹果正则 → 找不到数字 → **静默丢弃**。
     models, seen = [], set()
     for seg in segs:
-        for m in _parse_segment(seg, brand, required_cfg):
+        seg_brand = brand_of_model(seg, required_cfg) or brand
+        for m in _parse_segment(seg, seg_brand, required_cfg):
             if m and m not in seen:
                 seen.add(m)
                 models.append(m)
@@ -753,6 +875,47 @@ def extract_core_elements(observed, required_cfg, forbidden_words=None):
     return out
 
 
+def trim_features_to_budget(seg, feature_words, priority_keywords, target,
+                            count_mode="taobao"):
+    """
+    固定段 + 必含关键词超出目标长度时，**按需削减特征词**。
+
+    用户要求（2026-09-26）：长度放不下时优先减特征，而不是让
+    必填词 / 机型附加词 / 核心元素缺失。
+
+    策略：优先丢**最长**的特征词（省得最多），保持其余特征词的原有相对顺序。
+    返回 (保留的特征词, 被丢掉的特征词)。
+    """
+    W = lambda s: count_length(s or "", count_mode)
+    feats = [w for w in (feature_words or []) if w]
+    if not feats:
+        return [], []
+
+    # 固定段：机型段 + 三个必填词 + 材质（feature 本身不参与，正在决定它）
+    base = 0
+    for k, v in (seg or {}).items():
+        if k == "model_prefix":          # 旧槽位名，和 model_0 重复，不计
+            continue
+        if k.startswith("model_") or k in ("core_word", "new_word", "protect_word", "material"):
+            base += W(v)
+    need = base + sum(W(w) for w in (priority_keywords or []) if w)
+    room = target - need
+    if room < 0:
+        room = 0
+
+    if sum(W(w) for w in feats) <= room:
+        return feats, []
+
+    kept = list(feats)
+    dropped = []
+    for w in sorted(feats, key=W, reverse=True):     # 最长的先丢
+        if sum(W(x) for x in kept) <= room:
+            break
+        kept.remove(w)
+        dropped.append(w)
+    return kept, dropped
+
+
 def build_segments(model_name, material, required_cfg, feature_words=None,
                    models=None, rotate=0):
     """
@@ -785,26 +948,54 @@ def build_segments(model_name, material, required_cfg, feature_words=None,
     brands = _get_brands(required_cfg)
     # 品牌：优先按机型列表判定，没有机型就按原始文本判（用于报错提示）
     brand = detect_brand(models or model_name, required_cfg)
-    bcfg = brands.get(brand) or brands.get(_DEFAULT_BRAND) or {}
-
-    tpl = bcfg.get("title_template", "适用于苹果{model}")
-    tpl2 = bcfg.get("title_template_2", "iPhone{model}")
-    tpln = bcfg.get("title_template_n", "{model}")
-    # 单机型专用模板：苹果要一次带齐「苹果」「iPhone」
-    tpl1 = bcfg.get("title_template_single") or tpl
 
     def _naked(m):
         return strip_brand_prefix(m, required_cfg)
 
+    def _tpl_of(b, key, default):
+        return ((brands.get(b) or {}).get(key)) or default
+
+    def _carry_tpl(b):
+        """
+        该品牌的「带齐品牌词、但**不加适用前缀**」写法。
+
+        苹果 适用于苹果iPhone{model} -> 苹果iPhone{model}
+        华为 适用华为{model}        -> 华为{model}
+        小米 适用小米{model}        -> 小米{model}
+
+        用途：一个单元格混多个品牌时，只在**最前面**加一次「适用」，
+              后续品牌直接用「品牌+机型」——省长度（实测能省 8~16 字符），
+              品牌词依然出现，不会造成品牌缺失。
+        """
+        s = _tpl_of(b, "title_template_single", _tpl_of(b, "title_template", "适用{model}"))
+        return re.sub(r"^适用(于)?", "", s) or "{model}"
+
     if models:
-        if len(models) == 1:
-            # 单机型：用专用模板，苹果要一次带齐「苹果」「iPhone」
-            seg["model_0"] = tpl1.format(model=_naked(models[0]))
-        else:
-            seg["model_0"] = tpl.format(model=_naked(models[0]))
-            seg["model_1"] = tpl2.format(model=_naked(models[1]))
-            for i, m in enumerate(models[2:], start=2):
-                seg[f"model_{i}"] = tpln.format(model=_naked(m))
+        # ★ 每个机型按**自己的品牌**选模板；同一品牌内按出现次序（2026-09-26）
+        #   一个单元格可能混多个品牌（折叠屏通用壳），不能整段只用一个品牌的模板。
+        counts = {}
+        for m in models:
+            b = brand_of_model(m, required_cfg)
+            counts[b] = counts.get(b, 0) + 1
+        ordn = {}
+        for i, m in enumerate(models):
+            b = brand_of_model(m, required_cfg)
+            k = ordn.get(b, 0)
+            ordn[b] = k + 1
+            naked = _naked(m)
+            if i == 0:
+                # 最前面那个：单机型用 single（一次带齐品牌词），多机型用 title_template
+                txt = (_tpl_of(b, "title_template_single",
+                               _tpl_of(b, "title_template", "适用{model}"))
+                       if counts[b] == 1 else _tpl_of(b, "title_template", "适用{model}"))
+            elif k == 0:
+                # 另一个品牌的第一个机型：带品牌但不重复「适用」
+                txt = _carry_tpl(b)
+            elif k == 1:
+                txt = _tpl_of(b, "title_template_2", "{model}")
+            else:
+                txt = _tpl_of(b, "title_template_n", "{model}")
+            seg[f"model_{i}"] = txt.format(model=naked)
     else:
         # ★ 绝不编造机型 / 品牌。留空，由调用方明确报错并跳过该行。
         seg["model_0"] = ""
@@ -1063,6 +1254,10 @@ def assemble_exact(segments, keywords, padding_pool, target,
         text_done = 0
         picked = []
         queue = [w for w in trial_words if w]
+        # ★ 必含词（priority_keywords）被防粘连拦下延后落位时，
+        #   别的词不能把它该占的长度吃光 —— 这里给它们**预留**长度。
+        #   （踩坑：4 机型 + 多品牌的标题预算极紧，duo/DUO 总被挤掉）
+        pri_all = [w for w in (priority_keywords or []) if w]
         for kind, val in layout:
             if kind == "text":
                 t = join_text(t, val)
@@ -1071,19 +1266,32 @@ def assemble_exact(segments, keywords, padding_pool, target,
             if kind != "kw":
                 continue
             remaining_text = total_text_w - text_done
-            rest, chosen = [], None
-            for i, kw in enumerate(queue):
-                if kw in picked:
-                    continue
-                if not can_join(t, kw):
-                    rest.append(kw)          # 本槽位放不下 → 下个槽位再试
-                    continue
-                cand = join_text(t, kw)
-                if W(cand) + remaining_text <= target:
-                    chosen = kw
-                    rest += queue[i + 1:]
-                    break
-                rest.append(kw)
+
+            def _pick(use_reserve):
+                rest, chosen = [], None
+                for i, kw in enumerate(queue):
+                    if kw in picked:
+                        continue
+                    if not can_join(t, kw):
+                        rest.append(kw)      # 本槽位放不下 → 下个槽位再试
+                        continue
+                    cand = join_text(t, kw)
+                    # 除当前词外，还没落位的必含词要预留长度
+                    reserve = (sum(W(w) for w in pri_all if w not in picked and w != kw)
+                               if use_reserve else 0)
+                    if W(cand) + remaining_text + reserve <= target:
+                        chosen = kw
+                        rest += queue[i + 1:]
+                        break
+                    rest.append(kw)
+                return chosen, rest
+
+            # 第一轮带预留（保证必含词有位置）；若一个词都放不下（预留把预算占满、
+            # 而必含词又被防粘连拦住），就放开预留重试 —— 否则会**死锁**，
+            # 关键词槽位全空，标题只能靠补足词凑。
+            chosen, rest = _pick(True)
+            if chosen is None:
+                chosen, rest = _pick(False)
             if chosen:
                 t = join_text(t, chosen)
                 picked.append(chosen)
@@ -1319,26 +1527,34 @@ def validate_title(title, model_name, rules, required_cfg, forbidden_cfg, models
             if suf and suf not in title:
                 issues.append(f"机型「{m}」未出现")
 
-        # 品牌词：本品牌的必须出现（require_brand_words），且各只能出现 1 次
-        actual_brand = detect_brand(ms or model_name, required_cfg)
+        # 品牌词：**每个出现的品牌**都必须带齐自己的品牌词（各只能出现 1 次）
+        # ★ 2026-09-26：一个单元格可能混多个品牌（折叠屏通用壳），
+        #   原来只校验「整段判定的那一个品牌」，多品牌时会漏检。
         brands = _get_brands(required_cfg)
-        bcfg = brands.get(actual_brand) or {}
-        require_bw = bcfg.get("require_brand_words", True)
-        for w in (bcfg.get("brand_words") or []):
-            c = title.count(w)
-            if require_bw and c == 0:
-                issues.append(f"缺少品牌词「{w}」（{actual_brand}商品必须出现）")
-            elif c > 1:
-                issues.append(f"「{w}」出现 {c} 次（要求仅 1 次）")
+        present = []
+        for m in ms:
+            b = brand_of_model(m, required_cfg)
+            if b and b not in present:
+                present.append(b)
+        for actual_brand in present:
+            bcfg = brands.get(actual_brand) or {}
+            require_bw = bcfg.get("require_brand_words", True)
+            for w in (bcfg.get("brand_words") or []):
+                c = title.count(w)
+                if require_bw and c == 0:
+                    issues.append(f"缺少品牌词「{w}」（{actual_brand}商品必须出现）")
+                elif c > 1:
+                    issues.append(f"「{w}」出现 {c} 次（要求仅 1 次）")
 
-        # ★ 不能出现其它品牌的品牌词（华为商品里冒出「苹果」「iPhone」＝虚假品牌宣称）
+        # ★ 不能出现**没有对应机型**的品牌词
+        #   （华为商品里冒出「苹果」「iPhone」＝虚假品牌宣称）
         for other, ocfg in brands.items():
-            if other == actual_brand:
+            if other in present:
                 continue
             for w in (ocfg.get("brand_words") or []):
                 if w and w in title:
                     issues.append(
-                        f"出现非本商品品牌词「{w}」（实际品牌：{actual_brand}）"
+                        f"出现非本商品品牌词「{w}」（本商品品牌：{'/'.join(present) or '未知'}）"
                     )
 
     return issues

@@ -39,6 +39,7 @@ from title_builder import (
     split_models,
     strip_brand_prefix,
     strip_model_keywords,
+    trim_features_to_budget,
     validate_title,
 )
 
@@ -240,6 +241,7 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
     total_elapsed, total_tokens = 0.0, 0
     last_title, last_issues, last_used = "", [], []
     last_segments, last_features, last_core_els = {}, [], []
+    last_dropped = []
     feedback = ""
 
     for attempt in range(1, max_attempts + 1):
@@ -271,19 +273,6 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
         #   （支架类词从 4 个候选里按行轮换取一个，增加名称多样性）
         feature_words = detect_features(row_data, raw_keywords, required_cfg, rotate=rotate)
 
-        segments = build_segments(model_name, material, required_cfg,
-                                  feature_words, models=models, rotate=rotate)
-        prefix_text = "".join(segments.values())
-
-        # 固定段已占用的词，关键词里不得再出现（避免重复表达）
-        reserved = list(required_cfg.get("must_include", []) or [])
-        if material:
-            reserved.append(material)
-        # 品牌词由固定段承载，关键词里不许再出现（否则品牌词会重复）
-        reserved += brand_words_of(detect_brand(models, required_cfg), required_cfg)
-        reserved += models
-        reserved += [strip_brand_prefix(m, required_cfg) for m in models]
-
         # ★ 机型附加词（如 iPhoneDuo → 标题里还要各出现一次 duo / DUO）
         #   它们是**必须出现**的词，通过 priority_keywords 传给组装函数：
         #   **不参与 rotate 轮换、固定优先取用** —— 否则会被轮换挤到队尾取不到。
@@ -299,6 +288,28 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
         ce_cfg = required_cfg.get("core_elements") or {}
         n_max = int(ce_cfg.get("max_per_title", 3) or 0)
         core_priority = core_els[:n_max] if n_max > 0 else []
+
+        segments = build_segments(model_name, material, required_cfg,
+                                  feature_words, models=models, rotate=rotate)
+
+        # ★ 预算不足时**削减特征词**（用户 2026-09-26 要求：放不下就减特征）
+        #   机型多 + 多品牌时固定段极长（4 机型跨 3 品牌光机型段就 55 字符），
+        #   此时优先保必填词 / 机型附加词 / 核心元素，特征词按长度从大到小让位。
+        feature_words, dropped_feats = trim_features_to_budget(
+            segments, feature_words, core_priority + extra_kws, target)
+        if dropped_feats:
+            segments = build_segments(model_name, material, required_cfg,
+                                      feature_words, models=models, rotate=rotate)
+        prefix_text = "".join(segments.values())
+
+        # 固定段已占用的词，关键词里不得再出现（避免重复表达）
+        reserved = list(required_cfg.get("must_include", []) or [])
+        if material:
+            reserved.append(material)
+        # 品牌词由固定段承载，关键词里不许再出现（否则品牌词会重复）
+        reserved += brand_words_of(detect_brand(models, required_cfg), required_cfg)
+        reserved += models
+        reserved += [strip_brand_prefix(m, required_cfg) for m in models]
 
         # ★ 关键词池 = 模型看图特征词 + 运营词库（搜索词→卖点词→精准词）
         #   差异化：本批次已被其他商品用过的词库词，排到后面（优先用没用过的）
@@ -375,6 +386,7 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
         last_title, last_issues, last_used = title, issues, used
         last_segments, last_features = segments, feature_words
         last_core_els = core_priority
+        last_dropped = dropped_feats
         if not issues:
             break
         feedback = "；".join(issues)
@@ -390,4 +402,5 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
         "segments": last_segments,
         "feature_words": last_features,
         "core_elements": last_core_els,
+        "dropped_features": last_dropped,
     }
