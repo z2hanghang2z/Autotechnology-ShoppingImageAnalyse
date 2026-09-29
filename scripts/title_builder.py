@@ -836,7 +836,8 @@ def required_extra_keywords(models, required_cfg):
     return out
 
 
-def extract_core_elements(observed, required_cfg, forbidden_words=None):
+def extract_core_elements(observed, required_cfg, forbidden_words=None,
+                          reserved_words=None):
     """
     从视觉模型的 `observed.图案` 里提取**核心设计元素**。
 
@@ -846,6 +847,12 @@ def extract_core_elements(observed, required_cfg, forbidden_words=None):
 
     例：observed = {"图案": "城堡、英文字母"}          → ['城堡']
         observed = {"图案": "大象、彩虹、花朵、蛋糕"} → ['大象', '彩虹', '花朵', '蛋糕']
+
+    reserved_words —— 固定段已占用的词（品牌词 / 材质 / 必填词 / 机型）。
+        ★ 必须过滤：核心元素走 `priority_keywords`，**不经过 filter_keywords**，
+          品牌词去重拦不住它。
+          实测（2026-09-29）：商品设计是「缤纷苹果」，模型输出图案含「苹果」，
+          结果标题里出现两次「苹果」（一次是品牌、一次是设计）→ 校验报错。
     """
     cfg = required_cfg.get("core_elements") or {}
     if not cfg.get("enabled", True):
@@ -860,6 +867,7 @@ def extract_core_elements(observed, required_cfg, forbidden_words=None):
 
     exclude = {str(x).strip() for x in (cfg.get("exclude") or []) if str(x or "").strip()}
     fw = [str(w) for w in (forbidden_words or []) if w]
+    rw = [str(w) for w in (reserved_words or []) if w]
     out = []
     for part in re.split(r"[、,，;；/|]+|\s+", raw):
         w = str(part).strip()
@@ -870,6 +878,8 @@ def extract_core_elements(observed, required_cfg, forbidden_words=None):
         if not (2 <= len(w) <= 8):         # 太短没意义，太长放不下
             continue
         if any(f and f in w for f in fw):  # 命中违禁词直接跳过
+            continue
+        if any(r and r in w for r in rw):  # 与固定段重复（品牌词/材质/必填词/机型）
             continue
         out.append(w)
     return out

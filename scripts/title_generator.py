@@ -23,6 +23,7 @@ from ollama_client import chat_with_image
 from title_builder import (
     all_forbidden_words,
     assemble_exact,
+    brand_of_model,
     brand_words_of,
     build_segments,
     collect_bank_words,
@@ -279,12 +280,26 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
         #   若紧邻机型段会被防粘连拦掉，机制会自动留到下一个槽位再试。
         extra_kws = required_extra_keywords(models, required_cfg)
 
+        # 固定段已占用的词，关键词里不得再出现（避免重复表达）
+        reserved = list(required_cfg.get("must_include", []) or [])
+        if material:
+            reserved.append(material)
+        # 品牌词由固定段承载，关键词里不许再出现（否则品牌词会重复）
+        # ★ 多品牌：每个出现的品牌，其品牌词都要算进保留词
+        for _m in models:
+            reserved += brand_words_of(brand_of_model(_m, required_cfg), required_cfg)
+        reserved += models
+
         # ★ 核心元素（设计 / 图案）：模型识别的图案主题词（城堡/大象/彩虹…）
         #   配额只保留模型词最前面几个，设计元素排在后面会被截掉 →
         #   这里把它们放到**最优先位置**（不参与轮换），保证一定被取到。
-        #   ⚠️ 踩坑：曾把它们前置到模型词列表里，结果被 `rotate` 轮换转到队尾，
+        #   ⚠️ 踩坑1：曾把它们前置到模型词列表里，结果被 `rotate` 轮换转到队尾，
         #      只有 rotate=0 的那一行生效 —— 必须走 priority_keywords 才稳。
-        core_els = extract_core_elements(data.get("observed"), required_cfg, fwords)
+        #   ⚠️ 踩坑2（2026-09-29）：priority_keywords **不经过 filter_keywords**，
+        #      所以核心元素必须**自己**过滤保留词。实测商品设计是「缤纷苹果」，
+        #      模型图案输出「苹果」→ 标题出现两次「苹果」（品牌 + 设计）→ 校验报错。
+        core_els = extract_core_elements(data.get("observed"), required_cfg, fwords,
+                                         reserved_words=reserved)
         ce_cfg = required_cfg.get("core_elements") or {}
         n_max = int(ce_cfg.get("max_per_title", 3) or 0)
         core_priority = core_els[:n_max] if n_max > 0 else []
@@ -302,13 +317,7 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
                                       feature_words, models=models, rotate=rotate)
         prefix_text = "".join(segments.values())
 
-        # 固定段已占用的词，关键词里不得再出现（避免重复表达）
-        reserved = list(required_cfg.get("must_include", []) or [])
-        if material:
-            reserved.append(material)
-        # 品牌词由固定段承载，关键词里不许再出现（否则品牌词会重复）
-        reserved += brand_words_of(detect_brand(models, required_cfg), required_cfg)
-        reserved += models
+        reserved += [strip_brand_prefix(m, required_cfg) for m in models]
         reserved += [strip_brand_prefix(m, required_cfg) for m in models]
 
         # ★ 关键词池 = 模型看图特征词 + 运营词库（搜索词→卖点词→精准词）
