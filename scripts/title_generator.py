@@ -69,11 +69,15 @@ PROMPT_TEMPLATE = """请仔细观察这张手机壳图片，输出 JSON 格式�
 3. 覆盖这些维度：工艺、功能、风格、适用人群、使用场景
 4. 必须包含图中真实可见的特征（颜色、图案元素）
 5. 【严禁】包含任何机型信息（iPhone、苹果、三星、华为、小米、折叠屏等），机型由商品资料提供
-6. 【★★ 严禁编造功能特征】只写**图片里能明确看到**的功能结构。
-   尤其是「支架」「支点」「旋转支架」「挂绳」「挂链」「吊绳」「手绳」「磁吸」「无线充」
-   这类**产品属性宣称**——图片里没有明确对应的结构（立式支架、挂绳孔/挂链、磁吸环）就
-   一个字都不能写。写错属于**虚假宣传**，会导致投诉和退货。
-   这些特征由商品资料统一判定，**不需要你判断**。
+6. 【★★ 严禁编造功能特征】你只能写**图片里能明确看到**的东西，
+   **不要罗列「这类商品通常有哪些功能」的清单**。
+   尤其是「支架」「支点」「旋转支架」「挂绳」「挂链」「吊绳」「手绳」
+   「磁吸」「磁力」「磁吸环」「无线充」「magsafe」这类**产品属性宣称**——
+   图片里没有明确对应的结构（立式支架、挂绳孔/挂链、磁吸环）就一个字都不能写。
+   写错属于**虚假宣传**，会导致投诉和退货。这些特征由商品资料统一判定，
+   **不需要你判断，也不要出现在 keywords 里**。
+   反例（绝对不要这样）：一张普通卡通壳的图，却输出
+   ["可爱","卡通","支架","旋转","磁吸","挂绳","防摔"] —— 后四个都是凭空猜的。
 7. 可以包含通用风格词（如 ins风、Q版、3D立体），但【严禁】自创任何英文品牌名、
    英文单词串或看起来像品牌名的字母组合（例如 timeTastyBalancingAct 这类无意义字母串）
 8. 【严禁】堆砌同前缀词。例如不要同时给出"撞色款""撞色设计""撞色风格"，
@@ -128,7 +132,8 @@ def _has_bad_ascii(kw, ascii_cfg):
 
 
 def filter_keywords(keywords, forbidden_words, rules, prefix_text="",
-                    reserved_words=None, ascii_cfg=None, soft_reserved=None):
+                    reserved_words=None, ascii_cfg=None, soft_reserved=None,
+                    blocklist=None):
     """
     过滤模型给出的关键词：
         去违禁词 / 去机型词 / 去材质词 / 去自创英文串 / 去近义堆砌 /
@@ -138,12 +143,17 @@ def filter_keywords(keywords, forbidden_words, rules, prefix_text="",
                       （必填词、材质词、机型，避免重复表达）
     soft_reserved  —— 软性禁用：只挡**完全相同**的词
                       （条件特征词，如「支架」；这样「旋转支架」这类更具体的词才能用上）
+    blocklist      —— 模型关键词黑名单（结构性功能词）：含这些片段的**一律丢弃**
+                      （2026-09-30）模型会把支架/挂绳/磁吸当**通用功能词**输出，
+                      相当于列「可能有的功能清单」而非「图片里看到的功能」，
+                      这类功能只由 conditional_words 按 A 列判定。
     """
     from title_builder import is_near_duplicate, find_punctuation
 
     out, seen = [], []
     reserved = [w for w in (reserved_words or []) if w]
     soft = set(w for w in (soft_reserved or []) if w)
+    block = [str(w) for w in (blocklist or []) if w]
 
     for kw in keywords or []:
         kw = str(kw).strip()
@@ -153,6 +163,8 @@ def filter_keywords(keywords, forbidden_words, rules, prefix_text="",
         if find_punctuation(kw):          # 含标点 → 丢弃
             continue
         if kw in soft:                    # 与特征词完全相同 → 丢弃
+            continue
+        if any(b and b in kw for b in block):   # 结构性功能词，模型说了不算
             continue
         if any(fw and fw in kw for fw in forbidden_words):
             continue
@@ -331,7 +343,8 @@ def generate_one(cfg, confs, image_path, row_data, exclude_padding=None, rotate=
         keyword_pool = list(raw_keywords) + bank_words
         kws = filter_keywords(keyword_pool, fwords, rules,
                               prefix_text=prefix_text, reserved_words=reserved,
-                              ascii_cfg=ascii_cfg, soft_reserved=feature_words)
+                              ascii_cfg=ascii_cfg, soft_reserved=feature_words,
+                              blocklist=required_cfg.get("model_keyword_blocklist"))
 
         # ★ 限制模型特征词的占比：模型词最多占目标长度的 model_keyword_quota%
         #   剩下的长度留给运营词库，避免模型词吃光预算
