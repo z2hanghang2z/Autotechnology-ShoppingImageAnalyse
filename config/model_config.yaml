@@ -21,6 +21,10 @@ inference:
   think: false
   # 单次输出 token 上限：防止模型失控（实测曾出现单次 3881 tokens / 耗时 69s 的异常）
   num_predict: 900
+  # 上下文窗口（prompt + 输出）。
+  # ⚠️ 必须显式调大：Ollama 默认 4096，而「图片(~3900 tokens) + 提示词」会超
+  #    → 报 HTTP 400 exceed_context_size_error（2026-10-06 实测踩到）
+  num_ctx: 8192
   # 网络异常重试次数（实测 Ollama 服务可能中途崩溃，报 502/连接中断）
   max_retries: 3
   # 重试基础等待秒数（指数退避：2s, 4s, 8s）

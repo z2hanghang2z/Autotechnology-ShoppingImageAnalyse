@@ -83,6 +83,11 @@ def chat_with_image(cfg: dict, image_path: str, prompt: str,
     options = {"temperature": inf.get("temperature", 0.0)}
     if inf.get("num_predict"):
         options["num_predict"] = inf["num_predict"]
+    # ★ 上下文窗口必须显式设置（2026-10-06）
+    #   Ollama 默认 4096，而「图片(~3900 tokens) + 提示词」会超，
+    #   报 HTTP 400 exceed_context_size_error，整批任务全部失败。
+    if inf.get("num_ctx"):
+        options["num_ctx"] = inf["num_ctx"]
 
     payload = {
         "model": m["name"],
